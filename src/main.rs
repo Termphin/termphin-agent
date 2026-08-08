@@ -926,10 +926,18 @@ impl MasterState {
         let mut directory = self.directory.lock().expect("directory mutex poisoned");
         let destination = base_dir()?.join(new_name);
         if destination.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "session name is already in use",
-            ));
+            if UnixStream::connect(destination.join("control.sock")).is_ok() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "session name is already in use",
+                ));
+            }
+            // A directory left behind by a session that never shut down
+            // cleanly (SIGKILL, power loss, ...) - nothing is listening on
+            // its socket, so the name is free to reclaim rather than stuck
+            // forever. Mirrors the same self-heal `connect_or_create` does
+            // on attach.
+            fs::remove_dir_all(&destination)?;
         }
         fs::rename(&*directory, &destination)?;
         *directory = destination;
