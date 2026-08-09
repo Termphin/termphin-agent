@@ -4,9 +4,10 @@ use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -53,6 +54,11 @@ const FRAME_REPLAY_DONE: u8 = 106;
 /// restored screen in one piece instead of line by line. Terminal emulators
 /// drop unknown OSCs, so it stays invisible if it reaches a real terminal.
 const REPLAY_END_MARKER: &[u8] = b"\x1b]5380;termphin-replay-end\x07";
+
+const REBOOT_RESTORED_MARKER: &[u8] = b"\x1b]5381;termphin-reboot-restored\x07";
+
+const CWD_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const SCROLLBACK_FLUSH_EVERY_TICKS: u32 = 15;
 
 static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -150,6 +156,48 @@ fn session_dir(name: &str) -> io::Result<PathBuf> {
     Ok(base_dir()?.join(name))
 }
 
+fn current_boot_id() -> Option<String> {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|s| s.trim().to_owned())
+}
+
+fn shell_cwd(pid: libc::pid_t) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[derive(Default)]
+struct RestoreState {
+    cwd: Option<PathBuf>,
+    scrollback: Vec<u8>,
+    reboot_restored: bool,
+}
+
+fn boot_id_differs(persisted: Option<&str>, current: Option<&str>) -> bool {
+    match (persisted, current) {
+        (Some(old), Some(new)) => old.trim() != new.trim(),
+        _ => false,
+    }
+}
+
+impl RestoreState {
+    fn load(directory: &Path) -> Self {
+        let cwd = fs::read_to_string(directory.join("cwd"))
+            .ok()
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir());
+        let scrollback = fs::read(directory.join("scrollback")).unwrap_or_default();
+        let persisted_boot_id = fs::read_to_string(directory.join("boot_id")).ok();
+        let reboot_restored =
+            boot_id_differs(persisted_boot_id.as_deref(), current_boot_id().as_deref());
+        Self {
+            cwd,
+            scrollback,
+            reboot_restored,
+        }
+    }
+}
+
 fn socket_path(name: &str) -> io::Result<PathBuf> {
     Ok(session_dir(name)?.join("control.sock"))
 }
@@ -197,21 +245,27 @@ impl Drop for CreationLock {
 fn attach_command(name: &str, replay: bool) -> io::Result<()> {
     install_attach_signal_handlers()?;
     let _raw_mode = RawModeGuard::enable(libc::STDIN_FILENO)?;
+    let scrollback = Arc::new(Mutex::new(VecDeque::new()));
+    spawn_client_persistence_thread(name.to_owned(), Arc::clone(&scrollback));
 
     if !replay {
-        try_attach(name, false)?;
+        try_attach(name, false, &scrollback)?;
         return Ok(());
     }
-    if try_attach(name, true)? == Attachment::ReplayRejected {
+    if try_attach(name, true, &scrollback)? == Attachment::ReplayRejected {
         // Masters started by an older build refuse a history larger than one
         // frame. Reaching a session without its scrollback beats refusing to
         // reach it at all, so drop the replay and attach again.
-        try_attach(name, false)?;
+        try_attach(name, false, &scrollback)?;
     }
     Ok(())
 }
 
-fn try_attach(name: &str, replay: bool) -> io::Result<Attachment> {
+fn try_attach(
+    name: &str,
+    replay: bool,
+    scrollback: &Arc<Mutex<VecDeque<u8>>>,
+) -> io::Result<Attachment> {
     let size = terminal_size(libc::STDIN_FILENO);
     let mut stream = connect_or_create(name, size)?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -222,7 +276,7 @@ fn try_attach(name: &str, replay: bool) -> io::Result<Attachment> {
         send_frame(&mut stream, FRAME_HISTORY, &[])?;
     }
     send_frame(&mut stream, FRAME_ATTACH, &encode_size(size))?;
-    bridge_terminal(stream, replay)
+    bridge_terminal(stream, replay, scrollback)
 }
 
 #[derive(PartialEq, Eq)]
@@ -245,13 +299,17 @@ fn connect_or_create(name: &str, size: libc::winsize) -> io::Result<UnixStream> 
     }
 
     let directory = session_dir(name)?;
-    if directory.exists() {
+    let restore = if directory.exists() {
+        let restore = RestoreState::load(&directory);
         fs::remove_dir_all(&directory)?;
-    }
+        restore
+    } else {
+        RestoreState::default()
+    };
     fs::create_dir(&directory)?;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
 
-    if let Err(error) = spawn_master(name, size) {
+    if let Err(error) = spawn_master(name, size, restore) {
         let _ = fs::remove_dir_all(&directory);
         return Err(error);
     }
@@ -269,7 +327,7 @@ fn connect_or_create(name: &str, size: libc::winsize) -> io::Result<UnixStream> 
     ))
 }
 
-fn spawn_master(name: &str, size: libc::winsize) -> io::Result<()> {
+fn spawn_master(name: &str, size: libc::winsize, restore: RestoreState) -> io::Result<()> {
     let mut pipe_fds = [0; 2];
     if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(io::Error::last_os_error());
@@ -283,7 +341,7 @@ fn spawn_master(name: &str, size: libc::winsize) -> io::Result<()> {
     }
     if pid == 0 {
         close_fd(pipe_fds[0]);
-        master_process(name.to_owned(), size, pipe_fds[1]);
+        master_process(name.to_owned(), size, pipe_fds[1], restore);
     }
 
     close_fd(pipe_fds[1]);
@@ -297,7 +355,7 @@ fn spawn_master(name: &str, size: libc::winsize) -> io::Result<()> {
     }
 }
 
-fn master_process(name: String, size: libc::winsize, ready_fd: RawFd) -> ! {
+fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: RestoreState) -> ! {
     let setup = (|| -> io::Result<(UnixListener, File, Arc<MasterState>)> {
         if unsafe { libc::setsid() } < 0 {
             return Err(io::Error::last_os_error());
@@ -306,6 +364,7 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd) -> ! {
             libc::signal(libc::SIGHUP, libc::SIG_IGN);
             libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         }
+        install_master_sigterm_handler()?;
         redirect_stdio()?;
 
         let directory = session_dir(&name)?;
@@ -328,7 +387,13 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd) -> ! {
             return Err(io::Error::last_os_error());
         }
 
-        let shell_pid = spawn_shell(master_fd, slave_fd, listener.as_raw_fd(), ready_fd)?;
+        let shell_pid = spawn_shell(
+            master_fd,
+            slave_fd,
+            listener.as_raw_fd(),
+            ready_fd,
+            restore.cwd.as_deref(),
+        )?;
         close_fd(slave_fd);
 
         let created_at = SystemTime::now()
@@ -341,6 +406,15 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd) -> ! {
             fs::Permissions::from_mode(0o600),
         )?;
 
+        if let Some(id) = current_boot_id() {
+            let _ = fs::write(directory.join("boot_id"), &id);
+        }
+
+        let mut history = History::default();
+        if restore.reboot_restored && !restore.scrollback.is_empty() {
+            history.seed_restored(&restore.scrollback);
+        }
+
         let reader = unsafe { File::from_raw_fd(master_fd) };
         let writer = reader.try_clone()?;
         let state = Arc::new(MasterState {
@@ -350,9 +424,10 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd) -> ! {
             shell_pid,
             pty: Mutex::new(writer),
             clients: Mutex::new(HashMap::new()),
-            history: Mutex::new(History::default()),
+            history: Mutex::new(history),
             terminating: AtomicBool::new(false),
         });
+        spawn_persistence_thread(Arc::clone(&state));
         Ok((listener, reader, state))
     })();
 
@@ -391,6 +466,7 @@ fn spawn_shell(
     slave_fd: RawFd,
     listener_fd: RawFd,
     ready_fd: RawFd,
+    cwd: Option<&Path>,
 ) -> io::Result<libc::pid_t> {
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -425,6 +501,14 @@ fn spawn_shell(
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         libc::signal(libc::SIGINT, libc::SIG_DFL);
         libc::signal(libc::SIGTERM, libc::SIG_DFL);
+    }
+
+    if let Some(dir) = cwd
+        && let Ok(dir_c) = CString::new(dir.as_os_str().as_bytes())
+    {
+        unsafe {
+            libc::chdir(dir_c.as_ptr());
+        }
     }
 
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
@@ -522,6 +606,14 @@ impl History {
 
     fn alternate_screen_active(&self) -> bool {
         self.modes.alternate.is_some()
+    }
+
+    fn seed_restored(&mut self, scrollback: &[u8]) {
+        self.push(scrollback);
+        self.push(REBOOT_RESTORED_MARKER);
+        self.push(
+            b"\r\n\x1b[33mrestored after a server restart - new shell, same directory\x1b[0m\r\n\r\n",
+        );
     }
 }
 
@@ -1013,6 +1105,28 @@ impl MasterState {
         });
     }
 
+    fn flush_restore_state(&self, last_cwd: &mut Option<PathBuf>, force_scrollback: bool) {
+        let directory = self
+            .directory
+            .lock()
+            .expect("directory mutex poisoned")
+            .clone();
+        if let Some(cwd) = shell_cwd(self.shell_pid)
+            && last_cwd.as_deref() != Some(cwd.as_path())
+        {
+            let _ = fs::write(directory.join("cwd"), cwd.as_os_str().as_bytes());
+            *last_cwd = Some(cwd);
+        }
+        if force_scrollback {
+            let snapshot = self
+                .history
+                .lock()
+                .expect("history mutex poisoned")
+                .snapshot();
+            let _ = fs::write(directory.join("scrollback"), snapshot);
+        }
+    }
+
     fn finish(&self) -> ! {
         if !self.terminating.swap(true, Ordering::SeqCst) {
             let writers = self
@@ -1159,7 +1273,11 @@ fn control_command(name: &str, kind: u8, payload: &[u8]) -> io::Result<()> {
     }
 }
 
-fn bridge_terminal(mut stream: UnixStream, replay_requested: bool) -> io::Result<Attachment> {
+fn bridge_terminal(
+    mut stream: UnixStream,
+    replay_requested: bool,
+    scrollback: &Arc<Mutex<VecDeque<u8>>>,
+) -> io::Result<Attachment> {
     let socket_fd = stream.as_raw_fd();
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
@@ -1222,6 +1340,7 @@ fn bridge_terminal(mut stream: UnixStream, replay_requested: bool) -> io::Result
             match frame {
                 (FRAME_OUTPUT, data) => {
                     painted = true;
+                    append_scrollback(scrollback, &data);
                     output.write_all(&data)?;
                     output.flush()?;
                 }
@@ -1381,6 +1500,127 @@ fn install_attach_signal_handlers() -> io::Result<()> {
     Ok(())
 }
 
+static MASTER_TERM_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_master_sigterm(_: libc::c_int) {
+    MASTER_TERM_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+fn install_master_sigterm_handler() -> io::Result<()> {
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    action.sa_sigaction = handle_master_sigterm as *const () as usize;
+    action.sa_flags = 0;
+    unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn spawn_persistence_thread(state: Arc<MasterState>) {
+    thread::spawn(move || {
+        let mut last_cwd: Option<PathBuf> = None;
+        let mut tick: u32 = 0;
+        loop {
+            if MASTER_TERM_REQUESTED.load(Ordering::SeqCst) {
+                state.flush_restore_state(&mut last_cwd, true);
+                unsafe {
+                    libc::_exit(0);
+                }
+            }
+            if state.terminating.load(Ordering::SeqCst) {
+                return;
+            }
+            thread::sleep(CWD_POLL_INTERVAL);
+            tick += 1;
+            state.flush_restore_state(
+                &mut last_cwd,
+                tick.is_multiple_of(SCROLLBACK_FLUSH_EVERY_TICKS),
+            );
+        }
+    });
+}
+
+fn append_scrollback(scrollback: &Arc<Mutex<VecDeque<u8>>>, data: &[u8]) {
+    let mut buf = scrollback.lock().expect("scrollback mutex poisoned");
+    buf.extend(data);
+    while buf.len() > HISTORY_SIZE {
+        buf.pop_front();
+    }
+}
+
+fn peer_pid(stream: &UnixStream) -> Option<libc::pid_t> {
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast(),
+            &mut len,
+        )
+    };
+    (result == 0).then_some(cred.pid)
+}
+
+fn child_pid_of(pid: libc::pid_t) -> Option<libc::pid_t> {
+    let content = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).ok()?;
+    content.split_whitespace().next()?.parse().ok()
+}
+
+fn client_side_shell_pid(name: &str) -> Option<libc::pid_t> {
+    let path = socket_path(name).ok()?;
+    let stream = UnixStream::connect(path).ok()?;
+    child_pid_of(peer_pid(&stream)?)
+}
+
+fn spawn_client_persistence_thread(name: String, scrollback: Arc<Mutex<VecDeque<u8>>>) {
+    thread::spawn(move || {
+        let Ok(directory) = session_dir(&name) else {
+            return;
+        };
+        let mut shell_pid = None;
+        for _ in 0..5 {
+            shell_pid = client_side_shell_pid(&name);
+            if shell_pid.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        let mut last_cwd: Option<PathBuf> = None;
+        let mut tick: u32 = 0;
+        loop {
+            thread::sleep(CWD_POLL_INTERVAL);
+            tick += 1;
+            if let Some(id) = current_boot_id() {
+                let _ = fs::write(directory.join("boot_id"), &id);
+            }
+            if let Some(pid) = shell_pid
+                && let Some(cwd) = shell_cwd(pid)
+                && last_cwd.as_deref() != Some(cwd.as_path())
+            {
+                let _ = fs::write(directory.join("cwd"), cwd.as_os_str().as_bytes());
+                last_cwd = Some(cwd);
+            }
+            if tick.is_multiple_of(SCROLLBACK_FLUSH_EVERY_TICKS) {
+                let snapshot: Vec<u8> = scrollback
+                    .lock()
+                    .expect("scrollback mutex poisoned")
+                    .iter()
+                    .copied()
+                    .collect();
+                if !snapshot.is_empty() {
+                    let _ = fs::write(directory.join("scrollback"), snapshot);
+                }
+            }
+        }
+    });
+}
+
 fn close_fd(fd: RawFd) {
     if fd >= 0 {
         unsafe {
@@ -1392,6 +1632,77 @@ fn close_fd(fd: RawFd) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "termphin-agent-test-{label}-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn restore_state_loads_persisted_cwd_and_scrollback() {
+        let dir = temp_dir("cwd-scrollback");
+        fs::write(dir.join("cwd"), dir.as_os_str().as_bytes()).unwrap();
+        fs::write(dir.join("scrollback"), b"previous output").unwrap();
+
+        let restore = RestoreState::load(&dir);
+        assert_eq!(restore.cwd.as_deref(), Some(dir.as_path()));
+        assert_eq!(restore.scrollback, b"previous output");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn restore_state_drops_cwd_that_no_longer_exists() {
+        let dir = temp_dir("missing-cwd");
+        fs::write(dir.join("cwd"), b"/does/not/exist/anywhere").unwrap();
+
+        let restore = RestoreState::load(&dir);
+        assert_eq!(restore.cwd, None);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn boot_id_differs_only_when_both_present_and_different() {
+        assert!(!boot_id_differs(Some("same-boot"), Some("same-boot")));
+        assert!(!boot_id_differs(Some("same-boot\n"), Some("same-boot")));
+        assert!(boot_id_differs(Some("old-boot"), Some("new-boot")));
+        assert!(!boot_id_differs(None, Some("new-boot")));
+        assert!(!boot_id_differs(Some("old-boot"), None));
+    }
+
+    #[test]
+    fn restore_state_with_no_persisted_boot_id_is_not_a_reboot() {
+        let dir = temp_dir("no-boot-id");
+        let restore = RestoreState::load(&dir);
+        assert!(!restore.reboot_restored);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn seed_restored_carries_scrollback_and_marks_it() {
+        let mut history = History::default();
+        history.seed_restored(b"$ echo hi\nhi\n");
+        let snapshot = history.snapshot();
+        assert!(
+            snapshot
+                .windows(b"$ echo hi\nhi\n".len())
+                .any(|window| window == b"$ echo hi\nhi\n")
+        );
+        assert!(
+            snapshot
+                .windows(REBOOT_RESTORED_MARKER.len())
+                .any(|window| window == REBOOT_RESTORED_MARKER)
+        );
+    }
 
     #[test]
     fn validates_session_names() {
