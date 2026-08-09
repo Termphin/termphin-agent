@@ -1021,8 +1021,10 @@ impl MasterState {
             .map(|current| current.ws_row != size.ws_row || current.ws_col != size.ws_col)
             .unwrap_or(true);
         self.set_window_size(size)?;
-        unsafe {
-            libc::kill(-self.shell_pid, libc::SIGWINCH);
+        if changed {
+            unsafe {
+                libc::kill(-self.shell_pid, libc::SIGWINCH);
+            }
         }
         Ok(changed)
     }
