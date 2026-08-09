@@ -554,6 +554,14 @@ struct ModeTracker {
     enabled_private_modes: BTreeSet<u16>,
     reset_default_on_modes: BTreeSet<u16>,
     application_keypad: bool,
+    /// Body of an OSC sequence (`ESC ] ... BEL`/`ESC ] ... ST`) currently
+    /// being parsed, e.g. `0;my title`.
+    osc_buffer: Vec<u8>,
+    /// Most recent window title (OSC 0 or 2), kept for the life of the
+    /// session regardless of the ring - unlike the bytes that set it, this
+    /// never gets evicted, so a reattach can restore it even long after the
+    /// original sequence has scrolled out of history.
+    last_title: Option<String>,
 }
 
 impl ModeTracker {
@@ -568,6 +576,10 @@ impl ModeTracker {
                 1 if byte == b'[' => {
                     self.state = 2;
                     self.sequence.clear();
+                }
+                1 if byte == b']' => {
+                    self.state = 3;
+                    self.osc_buffer.clear();
                 }
                 1 if byte == b'=' => {
                     self.application_keypad = true;
@@ -589,9 +601,42 @@ impl ModeTracker {
                     self.state = 0;
                     self.sequence.clear();
                 }
+                // OSC body, terminated by BEL or ST (`ESC \`).
+                3 if byte == 0x07 => {
+                    self.finish_osc();
+                    self.state = 0;
+                }
+                3 if byte == 0x1b => self.state = 4,
+                3 if self.osc_buffer.len() < 512 => self.osc_buffer.push(byte),
+                3 => {
+                    self.state = 0;
+                    self.osc_buffer.clear();
+                }
+                4 if byte == b'\\' => {
+                    self.finish_osc();
+                    self.state = 0;
+                }
+                // Not a valid ST after all - the ESC starts whatever comes next.
+                4 => {
+                    self.state = 1;
+                    self.sequence_offset = offset;
+                    self.osc_buffer.clear();
+                }
                 _ => self.state = 0,
             }
         }
+    }
+
+    /// Keeps the title (OSC 0 or 2) as long as this state lives, which is
+    /// what lets [`replay_prefix`] restore it after the setting sequence
+    /// itself has fallen out of the ring.
+    fn finish_osc(&mut self) {
+        if let Ok(text) = std::str::from_utf8(&self.osc_buffer)
+            && let Some(title) = text.strip_prefix("0;").or_else(|| text.strip_prefix("2;"))
+        {
+            self.last_title = Some(title.to_string());
+        }
+        self.osc_buffer.clear();
     }
 
     fn finish_csi(&mut self, final_byte: u8) {
@@ -628,10 +673,17 @@ impl ModeTracker {
     /// already been evicted from the ring - otherwise the replayed bytes take
     /// care of it, and repeating it here would clear what they just drew.
     fn replay_prefix(&self, retained_from: u64) -> Vec<u8> {
-        match self.alternate {
+        let mut prefix = match self.alternate {
             Some((mode, offset)) if offset < retained_from => format!("\x1b[?{mode}h").into_bytes(),
             _ => Vec::new(),
+        };
+        // Always resent, not just when evicted: a client that just missed the
+        // original sequence and one that still has it in its own scrollback
+        // both end up with the same, currently-correct title either way.
+        if let Some(title) = &self.last_title {
+            prefix.extend(format!("\x1b]0;{title}\x07").into_bytes());
         }
+        prefix
     }
 
     fn replay_suffix(&self) -> Vec<u8> {
@@ -1408,6 +1460,37 @@ mod tests {
             snapshot.iter().filter(|byte| **byte == b'x').count(),
             HISTORY_SIZE
         );
+    }
+
+    #[test]
+    fn title_survives_eviction_of_the_sequence_that_set_it() {
+        let mut history = History::default();
+        history.push(b"\x1b]0;claude code\x07");
+        history.push(&vec![b'x'; HISTORY_SIZE]);
+        let snapshot = history.snapshot();
+        // The setting sequence itself is long gone from the ring, but the
+        // title it set is resent so a client attaching now still learns it.
+        assert!(snapshot.starts_with(b"\x1b]0;claude code\x07"));
+        assert_eq!(
+            snapshot.iter().filter(|byte| **byte == b'x').count(),
+            HISTORY_SIZE
+        );
+    }
+
+    #[test]
+    fn title_terminated_with_st_is_recognised() {
+        let mut history = History::default();
+        history.push(b"\x1b]2;opencode\x1b\\");
+        let snapshot = history.snapshot();
+        assert!(snapshot.starts_with(b"\x1b]0;opencode\x07"));
+    }
+
+    #[test]
+    fn later_title_replaces_earlier_one() {
+        let mut history = History::default();
+        history.push(b"\x1b]0;first\x07\x1b]0;second\x07");
+        let snapshot = history.snapshot();
+        assert!(snapshot.starts_with(b"\x1b]0;second\x07"));
     }
 
     #[test]
