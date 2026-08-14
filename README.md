@@ -14,21 +14,36 @@ The part worth reading before letting anything run on a machine you care about.
 
 - **No network listener.** Every connection goes through a Unix socket at
   `~/.cache/termphin/sessions/<name>/control.sock`, created with mode `0600`
-  inside a directory created with mode `0700`. Nothing binds a port.
+  inside a directory created with mode `0700`. Nothing binds a port. On
+  Windows the equivalent is a named pipe under `%LOCALAPPDATA%\termphin\sessions`,
+  restricted to its owner via an ACL rather than a mode bit.
 - **No privileges.** Runs as your user. Nothing is installed system-wide, no
   setuid, no service unit, no cron entry.
-- **Everything lives under `~/.cache/termphin/sessions`.** One directory per
-  session holding the socket and a `created_at` stamp. Killing a session
-  removes its directory; nothing else on disk is touched.
+- **Everything lives under `~/.cache/termphin/sessions`** (`%LOCALAPPDATA%\termphin\sessions`
+  on Windows). One directory per session holding the socket and a `created_at`
+  stamp. Killing a session removes its directory; nothing else on disk is
+  touched.
 - **It starts your `$SHELL`** (or `/bin/sh`) as a login shell on a PTY, and
-  passes bytes between that PTY and the socket unchanged.
+  passes bytes between that PTY and the socket unchanged. On Windows that's
+  `powershell.exe` on a ConPTY pseudo console instead.
 - **Scrollback is held in memory only**, a 256 KiB ring per session. It is
-  never written to disk.
-- **One dependency**, `libc`, in about 1400 lines of one file, which is small
-  enough to read in an afternoon.
+  never written to disk, except a periodic snapshot so a reboot can restore it.
+- **One dependency on Unix**, `libc`, in about 1400 lines of one file, small
+  enough to read in an afternoon. Windows needs `windows-sys` for ConPTY and
+  named pipes and is a separate module.
 
-Authorization is the filesystem. Anyone who can reach the socket is already
-running as your user, and could read the PTY anyway.
+Authorization is the filesystem (or, on Windows, the pipe's ACL). Anyone who
+can reach it is already running as your user, and could read the PTY anyway.
+
+Windows has two gaps against the Unix build: the shell's working directory is
+not tracked or restored across a reboot, and a live terminal resize during an
+attach is polled every 300ms rather than delivered instantly - see the module
+doc in `src/windows.rs` for why. Persistence itself - a session surviving the
+SSH connection that started it - relies on the new master process breaking
+away from whatever job object owns the SSH session (Win32-OpenSSH's, usually).
+If that job doesn't permit breakaway, the session just doesn't outlive the
+connection, the same as a session that didn't shut down cleanly for any other
+reason - there is no separate "unsupported" mode.
 
 ## Commands
 
@@ -78,12 +93,13 @@ For the binaries Termphin actually ships, which need docker:
 ./scripts/build.sh
 ```
 
-That writes stripped static x86_64 and aarch64 binaries to `dist/` along with
-their SHA-256 manifest, using musl cross-compilation images pinned by digest.
-The same source and the same script produce the same checksums on any host, so
-you can verify that what Termphin uploads matches this repository. The app
-checks those checksums before uploading, and again against whatever is already
-on the server.
+That writes stripped static x86_64 and aarch64 Linux binaries plus an
+x86_64 Windows one to `dist/`, along with their SHA-256 manifest, using
+cross-compilation images pinned by digest (musl for Linux, mingw-w64 for
+Windows). The same source and the same script produce the same checksums on
+any host, so you can verify that what Termphin uploads matches this
+repository. The app checks those checksums before uploading, and again
+against whatever is already on the server.
 
 ## License
 
