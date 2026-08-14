@@ -574,6 +574,32 @@ fn shell_command_line() -> String {
     env::var("TERMPHIN_SHELL").unwrap_or_else(|_| "powershell.exe -NoLogo".to_owned())
 }
 
+/// PowerShell's `cd`/`Set-Location` only ever updates its own `$PWD`, never
+/// the process's actual OS-level current directory - so unlike Unix, where
+/// the agent reads `/proc/<pid>/cwd` from outside, there is nothing external
+/// to read here. This wraps whatever `prompt` function the shell already
+/// has (the user's own, from `$profile`, if any - never replaced, only
+/// chained) so it reports `$PWD` itself, over an OSC marker real terminals
+/// silently drop, the same trick `REPLAY_END_MARKER` already relies on.
+/// Written directly into the shell's input at spawn time, before any client
+/// can attach, so there is nothing for a human to see: by the time anyone
+/// looks, `Clear-Host` has already wiped the setup line back off-screen.
+fn install_cwd_reporting(pty_write: &SyncPipe) {
+    if !shell_command_line()
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("powershell")
+    {
+        return;
+    }
+    const SCRIPT: &str = "if (-not $function:__termphinOriginalPrompt) { \
+        $function:__termphinOriginalPrompt = $function:prompt }; \
+        function prompt { \
+        [Console]::Out.Write([char]27 + ']5382;termphin-cwd;' + $PWD.Path + [char]7); \
+        & $function:__termphinOriginalPrompt }; Clear-Host\r";
+    let _ = pty_write.write_all(SCRIPT.as_bytes());
+}
+
 /// Returns the pseudo console, the write end of its input pipe, the read end
 /// of its output pipe, and the shell process attached to it.
 fn spawn_conpty_shell(size: TermSize) -> io::Result<(PseudoConsole, SyncPipe, SyncPipe, ChildProcess)> {
@@ -1121,6 +1147,7 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
 
     let (pseudo_console, pty_write, pty_read, child) = spawn_conpty_shell(size)
         .map_err(|error| log_master_error(&directory_log, error))?;
+    install_cwd_reporting(&pty_write);
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
