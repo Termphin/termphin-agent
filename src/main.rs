@@ -9,6 +9,11 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
+// Only the Windows build calls into this, but it is pure byte-shuffling with
+// no syscalls, so it is compiled everywhere and its tests run on any host.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod win32_codec;
+
 pub(crate) const PROTOCOL_VERSION: u32 = 1;
 pub(crate) const MAX_FRAME_SIZE: usize = 1024 * 1024;
 /// Sized against the client's 2000-row transcript, which fits inside this even
