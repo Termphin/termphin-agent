@@ -2,11 +2,12 @@
 //! [`crate::unix`]: ConPTY instead of a PTY, a named pipe instead of a Unix
 //! socket, a detached re-exec instead of `fork`+`setsid` for persistence.
 //!
-//! Not implemented: shell cwd tracking/restore (no `/proc/<pid>/cwd`
-//! equivalent short of reading the child's PEB), and live-resize-during-attach
-//! is polled every 300ms off `GetConsoleScreenBufferInfo` rather than
-//! event-driven - `ENABLE_VIRTUAL_TERMINAL_INPUT` consumes the same
-//! input-record queue that would otherwise deliver `WINDOW_BUFFER_SIZE_EVENT`.
+//! cwd is reported via a PowerShell prompt hook emitting an OSC marker (no
+//! `/proc/<pid>/cwd` equivalent, and the child's PEB doesn't stay in sync
+//! with `cd`). Not implemented: live-resize-during-attach is polled every
+//! 300ms off `GetConsoleScreenBufferInfo` rather than event-driven -
+//! `ENABLE_VIRTUAL_TERMINAL_INPUT` consumes the same input-record queue that
+//! would otherwise deliver `WINDOW_BUFFER_SIZE_EVENT`.
 
 use std::collections::{HashMap, VecDeque};
 use std::env;
@@ -568,6 +569,80 @@ fn create_pipe_pair() -> io::Result<(HANDLE, HANDLE)> {
         return Err(last_error());
     }
     Ok((read, write))
+}
+
+/// Decodes Win32-Input-Mode (`CSI Vk;Sc;Uc;Kd;Cs;Rc _`) back into plain
+/// bytes - sshd's outer ConPTY wraps every keystroke this way once a pty is
+/// allocated, and fails to recognize arrow keys as one unit under it
+/// (`ESC[A` arrives as three separate `Vk=0` char events), which our inner
+/// ConPTY then mis-delivers to the shell the same way. Decoding back to
+/// plain bytes lets the inner ConPTY parse `ESC[A` itself.
+#[derive(Default)]
+struct Win32InputDecoder {
+    pending: Vec<u8>,
+    high_surrogate: Option<u16>,
+}
+
+impl Win32InputDecoder {
+    fn feed(&mut self, data: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(data);
+        const MAX_BODY_LEN: usize = 40;
+
+        let mut output = Vec::new();
+        let mut i = 0;
+        while i < self.pending.len() {
+            if self.pending[i] == 0x1b && i + 1 < self.pending.len() && self.pending[i + 1] == b'[' {
+                let search_from = i + 2;
+                let search_to = (search_from + MAX_BODY_LEN).min(self.pending.len());
+                match self.pending[search_from..search_to].iter().position(|&b| b == b'_') {
+                    Some(rel_end) => {
+                        let end = search_from + rel_end;
+                        let body = self.pending[search_from..end].to_vec();
+                        if let Some(decoded) = self.decode_body(&body) {
+                            output.extend(decoded);
+                            i = end + 1;
+                            continue;
+                        }
+                    }
+                    None if search_to - search_from < MAX_BODY_LEN => break,
+                    None => {}
+                }
+            }
+            output.push(self.pending[i]);
+            i += 1;
+        }
+        self.pending.drain(..i);
+        output
+    }
+
+    fn decode_body(&mut self, body: &[u8]) -> Option<Vec<u8>> {
+        let text = std::str::from_utf8(body).ok()?;
+        let mut parts = text.split(';');
+        let _vk: u32 = parts.next()?.parse().ok()?;
+        let _sc: u32 = parts.next()?.parse().ok()?;
+        let uc: u32 = parts.next()?.parse().ok()?;
+        let kd: u32 = parts.next()?.parse().ok()?;
+        let _cs: u32 = parts.next()?.parse().ok()?;
+        let _rc: u32 = parts.next()?.parse().ok()?;
+        if kd != 1 || uc == 0 {
+            return Some(Vec::new());
+        }
+        let unit = uc as u16;
+        if (0xD800..=0xDBFF).contains(&unit) {
+            self.high_surrogate = Some(unit);
+            return Some(Vec::new());
+        }
+        let scalar = if (0xDC00..=0xDFFF).contains(&unit) {
+            let high = self.high_surrogate.take()?;
+            0x10000 + (((high as u32 - 0xD800) << 10) | (unit as u32 - 0xDC00))
+        } else {
+            self.high_surrogate = None;
+            unit as u32
+        };
+        let ch = char::from_u32(scalar)?;
+        let mut buf = [0u8; 4];
+        Some(ch.encode_utf8(&mut buf).as_bytes().to_vec())
+    }
 }
 
 fn shell_command_line() -> String {
@@ -1477,6 +1552,7 @@ fn bridge_terminal(
     thread::spawn(move || {
         let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
         let mut buffer = [0_u8; 8192];
+        let mut win32_input = Win32InputDecoder::default();
         loop {
             let mut read = 0u32;
             let ok = unsafe {
@@ -1491,7 +1567,11 @@ fn bridge_terminal(
             if !win_bool(ok) || read == 0 {
                 return;
             }
-            if send_frame(&mut &*input_pipe, FRAME_INPUT, &buffer[..read as usize]).is_err() {
+            let decoded = win32_input.feed(&buffer[..read as usize]);
+            if decoded.is_empty() {
+                continue;
+            }
+            if send_frame(&mut &*input_pipe, FRAME_INPUT, &decoded).is_err() {
                 return;
             }
         }
@@ -1590,5 +1670,79 @@ impl Drop for ConsoleRawMode {
             SetConsoleMode(self.stdin, self.original_input_mode);
             SetConsoleMode(self.stdout, self.original_output_mode);
         }
+    }
+}
+
+#[cfg(test)]
+mod win32_input_decoder_tests {
+    use super::Win32InputDecoder;
+
+    #[test]
+    fn decodes_a_real_captured_up_arrow_into_plain_esc_bracket_a() {
+        // Captured verbatim from a real Win32-OpenSSH session's stdin: three
+        // separate "raw character" events (Vk=0) for ESC, '[', 'A' - not one
+        // recognised up-arrow key event. This is the exact input that used
+        // to print "[A" instead of recalling history.
+        let raw: &[u8] = &[
+            0x1b, 0x5b, 0x30, 0x3b, 0x30, 0x3b, 0x32, 0x37, 0x3b, 0x31, 0x3b, 0x30, 0x3b, 0x31,
+            0x5f, 0x1b, 0x5b, 0x30, 0x3b, 0x30, 0x3b, 0x39, 0x31, 0x3b, 0x31, 0x3b, 0x30, 0x3b,
+            0x31, 0x5f, 0x1b, 0x5b, 0x30, 0x3b, 0x30, 0x3b, 0x36, 0x35, 0x3b, 0x31, 0x3b, 0x30,
+            0x3b, 0x31, 0x5f,
+        ];
+        let mut decoder = Win32InputDecoder::default();
+        assert_eq!(decoder.feed(raw), vec![0x1b, b'[', b'A']);
+    }
+
+    #[test]
+    fn key_up_events_are_dropped_so_a_letter_is_not_doubled() {
+        // Real captured key-down/key-up pair for the letter 'e'.
+        let raw: &[u8] = &[
+            0x1b, 0x5b, 0x36, 0x39, 0x3b, 0x31, 0x38, 0x3b, 0x31, 0x30, 0x31, 0x3b, 0x31, 0x3b,
+            0x30, 0x3b, 0x31, 0x5f, 0x1b, 0x5b, 0x36, 0x39, 0x3b, 0x31, 0x38, 0x3b, 0x31, 0x30,
+            0x31, 0x3b, 0x30, 0x3b, 0x30, 0x3b, 0x31, 0x5f,
+        ];
+        let mut decoder = Win32InputDecoder::default();
+        assert_eq!(decoder.feed(raw), b"e".to_vec());
+    }
+
+    #[test]
+    fn a_sequence_split_across_two_reads_still_decodes() {
+        let mut decoder = Win32InputDecoder::default();
+        let first = decoder.feed(b"\x1b[0;0;65;1;0");
+        assert!(first.is_empty(), "incomplete sequence should not emit yet");
+        let second = decoder.feed(b";1_");
+        assert_eq!(second, vec![b'A']);
+    }
+
+    #[test]
+    fn plain_text_with_no_escape_sequences_passes_through_unchanged() {
+        let mut decoder = Win32InputDecoder::default();
+        assert_eq!(decoder.feed(b"hello"), b"hello".to_vec());
+    }
+
+    #[test]
+    fn an_escape_byte_not_followed_by_a_bracket_is_forwarded_literally() {
+        let mut decoder = Win32InputDecoder::default();
+        assert_eq!(decoder.feed(b"\x1bX"), vec![0x1b, b'X']);
+    }
+
+    #[test]
+    fn a_csi_sequence_with_no_underscore_terminator_is_forwarded_literally() {
+        // Not Win32-Input-Mode at all - e.g. a plain xterm sequence that
+        // happens to arrive on stdin unwrapped.
+        let mut decoder = Win32InputDecoder::default();
+        let input = b"\x1b[Hrest";
+        assert_eq!(decoder.feed(input), input.to_vec());
+    }
+
+    #[test]
+    fn surrogate_pair_reassembles_into_one_astral_character() {
+        // U+1F600 (grinning face) as UTF-16 surrogates: 0xD83D 0xDE00.
+        let high = 0xD83Du32;
+        let low = 0xDE00u32;
+        let seq = format!("\x1b[0;0;{high};1;0;1_\x1b[0;0;{low};1;0;1_");
+        let mut decoder = Win32InputDecoder::default();
+        let decoded = decoder.feed(seq.as_bytes());
+        assert_eq!(decoded, "😀".as_bytes().to_vec());
     }
 }
