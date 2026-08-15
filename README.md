@@ -35,10 +35,15 @@ The part worth reading before letting anything run on a machine you care about.
 Authorization is the filesystem (or, on Windows, the pipe's ACL). Anyone who
 can reach it is already running as your user, and could read the PTY anyway.
 
-Windows has two gaps against the Unix build: the shell's working directory is
-not tracked or restored across a reboot, and a live terminal resize during an
-attach is polled every 300ms rather than delivered instantly - see the module
-doc in `src/windows.rs` for why. Persistence itself - a session surviving the
+Windows has one gap against the Unix build: a live terminal resize during an
+attach is polled every 100ms rather than delivered instantly - see the module
+doc in `src/windows.rs` for why. The shell's working directory *is* tracked,
+but by a different route: PowerShell's `cd` never touches the process's real
+OS-level directory, so there is no `/proc/<pid>/cwd` equivalent to read from
+outside. Instead the shell is started with a `prompt` function - chained onto
+whatever the user's own profile defines, never replacing it - that reports
+`$PWD` over an OSC marker. It rides in on `-EncodedCommand` so the shell
+never echoes it. Persistence itself - a session surviving the
 SSH connection that started it - relies on the new master process breaking
 away from whatever job object owns the SSH session (Win32-OpenSSH's, usually).
 If that job doesn't permit breakaway, the session just doesn't outlive the

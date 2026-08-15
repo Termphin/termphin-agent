@@ -61,7 +61,9 @@ use crate::{
 };
 use crate::win32_codec::{CWD_PROMPT_HOOK, Win32InputDecoder, base64_utf16le};
 
-const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(300);
+/// Ten cheap console reads a second, against a visible lag on every rotation
+/// and keyboard toggle if it were longer.
+const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn to_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
@@ -572,6 +574,8 @@ fn create_pipe_pair() -> io::Result<(HANDLE, HANDLE)> {
     Ok((read, write))
 }
 
+/// The hook rides in on the command line, not the shell's input: typed, the
+/// shell echoes it, and hiding that took a `Clear-Host` that wiped scrollback.
 fn shell_command_line() -> String {
     if let Ok(custom) = env::var("TERMPHIN_SHELL") {
         return custom;

@@ -23,11 +23,9 @@ impl Win32InputDecoder {
         while i < self.pending.len() {
             if self.pending[i] == 0x1b && i + 1 < self.pending.len() && self.pending[i + 1] == b'[' {
                 let body_start = i + 2;
-                // A body is only ever digits and semicolons, so the first byte
-                // that is neither settles it: this is some other CSI (`ESC[H`
-                // and friends) and must go out as-is. Waiting for a `_` that
-                // will never arrive would strand it in the buffer until the
-                // next keystroke pushed it through.
+                // A body is only digits and semicolons, so the first byte that
+                // is neither settles it: some other CSI (`ESC[H`), and waiting
+                // for a `_` would strand it until the next keystroke.
                 let mut end = body_start;
                 while end < self.pending.len()
                     && end - body_start < MAX_BODY_LEN
@@ -43,8 +41,7 @@ impl Win32InputDecoder {
                         continue;
                     }
                 } else if end == self.pending.len() && end - body_start < MAX_BODY_LEN {
-                    // Still all body so far, just nothing after it yet - the
-                    // rest of the sequence may be in the next read.
+                    // Still all body - the rest may be in the next read.
                     break;
                 }
             }
@@ -85,13 +82,10 @@ impl Win32InputDecoder {
     }
 }
 
-/// PowerShell's `cd`/`Set-Location` only ever updates its own `$PWD`, never
-/// the process's actual OS-level current directory - so unlike Unix, where
-/// the agent reads `/proc/<pid>/cwd` from outside, there is nothing external
-/// to read here. This wraps whatever `prompt` function the shell already
-/// has (the user's own, from `$profile`, if any - never replaced, only
-/// chained) so it reports `$PWD` itself, over an OSC marker real terminals
-/// silently drop, the same trick `REPLAY_END_MARKER` already relies on.
+/// PowerShell's `cd` never touches the process's real directory, so there is
+/// no `/proc/<pid>/cwd` equivalent to read from outside. Chains onto the
+/// user's own `prompt` - never replaces it - and reports `$PWD` over an OSC
+/// marker real terminals drop, as `REPLAY_END_MARKER` already does.
 pub(crate) const CWD_PROMPT_HOOK: &str = "if (-not $function:__termphinOriginalPrompt) { \
     $function:__termphinOriginalPrompt = $function:prompt }; \
     function prompt { \
@@ -133,8 +127,7 @@ mod base64_tests {
 
     #[test]
     fn matches_powershell_encoded_command_format() {
-        // What `[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('hi'))`
-        // returns - the exact encoding -EncodedCommand expects.
+        // What `[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('hi'))` returns.
         assert_eq!(base64_utf16le("hi"), "aABpAA==");
     }
 
@@ -160,10 +153,8 @@ mod win32_input_decoder_tests {
 
     #[test]
     fn decodes_a_real_captured_up_arrow_into_plain_esc_bracket_a() {
-        // Captured verbatim from a real Win32-OpenSSH session's stdin: three
-        // separate "raw character" events (Vk=0) for ESC, '[', 'A' - not one
-        // recognised up-arrow key event. This is the exact input that used
-        // to print "[A" instead of recalling history.
+        // Captured from a real session: three raw char events (Vk=0) for
+        // ESC, '[', 'A', not one up-arrow. Used to print "[A".
         let raw: &[u8] = &[
             0x1b, 0x5b, 0x30, 0x3b, 0x30, 0x3b, 0x32, 0x37, 0x3b, 0x31, 0x3b, 0x30, 0x3b, 0x31,
             0x5f, 0x1b, 0x5b, 0x30, 0x3b, 0x30, 0x3b, 0x39, 0x31, 0x3b, 0x31, 0x3b, 0x30, 0x3b,
@@ -209,16 +200,13 @@ mod win32_input_decoder_tests {
 
     #[test]
     fn a_csi_sequence_with_no_underscore_terminator_is_forwarded_literally() {
-        // Not Win32-Input-Mode at all - e.g. a plain xterm sequence that
-        // happens to arrive on stdin unwrapped.
+        // A plain xterm sequence arriving unwrapped.
         let mut decoder = Win32InputDecoder::default();
         let input = b"\x1b[Hrest";
         assert_eq!(decoder.feed(input), input.to_vec());
     }
 
-    /// Every special key the app's toolbar can send arrives as a run of raw
-    /// character events, one per byte of its escape sequence, and has to come
-    /// back out as exactly that sequence.
+    /// Toolbar keys arrive as one raw char event per byte of their sequence.
     #[test]
     fn the_special_keys_the_toolbar_sends_all_survive_a_round_trip() {
         for (name, sequence) in [
@@ -254,8 +242,7 @@ mod win32_input_decoder_tests {
         }
     }
 
-    /// The same keys arriving unwrapped must pass straight through rather
-    /// than being held back waiting for a terminator.
+    /// Unwrapped, the same keys must pass through, not wait for a terminator.
     #[test]
     fn unwrapped_special_keys_are_not_swallowed() {
         for sequence in [
