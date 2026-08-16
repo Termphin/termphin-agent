@@ -21,7 +21,8 @@ impl Win32InputDecoder {
         let mut output = Vec::new();
         let mut i = 0;
         while i < self.pending.len() {
-            if self.pending[i] == 0x1b && i + 1 < self.pending.len() && self.pending[i + 1] == b'[' {
+            if self.pending[i] == 0x1b && i + 1 < self.pending.len() && self.pending[i + 1] == b'['
+            {
                 let body_start = i + 2;
                 // A body is only digits and semicolons, so the first byte that
                 // is neither settles it: some other CSI (`ESC[H`), and waiting
@@ -142,7 +143,10 @@ mod base64_tests {
     #[test]
     fn the_real_hook_round_trips_back_to_itself() {
         let encoded = base64_utf16le(super::CWD_PROMPT_HOOK);
-        assert!(!encoded.contains(' '), "must survive a command line unquoted");
+        assert!(
+            !encoded.contains(' '),
+            "must survive a command line unquoted"
+        );
         assert_eq!(encoded.len() % 4, 0);
     }
 }

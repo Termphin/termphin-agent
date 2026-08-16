@@ -15,12 +15,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
-    CLIENT_WRITE_TIMEOUT, ClientQueue, FRAME_ATTACH, FRAME_ERROR, FRAME_EXIT, FRAME_HISTORY,
-    FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_REPLAY_DONE, FRAME_RESIZE,
-    FRAME_RENAME, FRAME_STATUS, FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT, History, MAX_CLIENTS,
-    REPLAY_CHUNK_SIZE, REPLAY_END_MARKER, RestoreState, SCROLLBACK_FLUSH_EVERY_TICKS, TermSize,
-    append_scrollback, decode_size, encode_size, invalid_input, read_frame, send_frame,
-    validate_name, CWD_POLL_INTERVAL,
+    CLIENT_WRITE_TIMEOUT, CWD_POLL_INTERVAL, ClientQueue, FRAME_ATTACH, FRAME_ERROR, FRAME_EXIT,
+    FRAME_HISTORY, FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_RENAME,
+    FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_STATUS, FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT,
+    History, MAX_CLIENTS, REPLAY_CHUNK_SIZE, REPLAY_END_MARKER, RestoreState,
+    SCROLLBACK_FLUSH_EVERY_TICKS, TermSize, append_scrollback, decode_size, encode_size,
+    invalid_input, read_frame, send_frame, validate_name,
 };
 
 static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
@@ -276,9 +276,9 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
             let _ = fs::write(directory.join("boot_id"), &id);
         }
 
-        let mut history = History::default();
-        if restore.reboot_restored && !restore.scrollback.is_empty() {
-            history.seed_restored(&restore.scrollback);
+        let mut history = History::new(size.ws_row, size.ws_col);
+        if restore.restored {
+            history.seed_restored(&restore.scrollback, restore.reboot_restored);
         }
 
         let reader = unsafe { File::from_raw_fd(master_fd) };
@@ -585,7 +585,7 @@ impl MasterState {
         // Held across both steps so output arriving mid-replay queues behind the
         // snapshot. Queueing never blocks, so a slow client cannot hold the PTY
         // reader hostage.
-        let history = self.history.lock().expect("history mutex poisoned");
+        let mut history = self.history.lock().expect("history mutex poisoned");
         if replay {
             for chunk in history.snapshot().chunks(REPLAY_CHUNK_SIZE) {
                 channel.send(FRAME_OUTPUT, chunk)?;
@@ -655,42 +655,15 @@ impl MasterState {
             .unwrap_or(true);
         self.set_window_size(size)?;
         if changed {
+            self.history
+                .lock()
+                .expect("history mutex poisoned")
+                .resize(size.ws_row, size.ws_col);
             unsafe {
                 libc::kill(-self.shell_pid, libc::SIGWINCH);
             }
         }
         Ok(changed)
-    }
-
-    /// Nudges a full-screen application into repainting by briefly shrinking
-    /// the PTY by one row.
-    ///
-    /// The alternate buffer has no scrollback to replay, so making the
-    /// application draw again is the only portable way to recover the frame.
-    /// Skipped elsewhere, where the replay is already exact and a spurious
-    /// resize would reflow the prompt for nothing.
-    fn request_redraw(&self) {
-        if !self
-            .history
-            .lock()
-            .expect("history mutex poisoned")
-            .alternate_screen_active()
-        {
-            return;
-        }
-        let Some(size) = self.window_size() else {
-            return;
-        };
-        if size.ws_row < 2 {
-            return;
-        }
-        let mut shrunk = size;
-        shrunk.ws_row -= 1;
-        if self.set_window_size(shrunk).is_err() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(40));
-        let _ = self.set_window_size(size);
     }
 
     fn status(&self) -> String {
@@ -822,13 +795,7 @@ fn client_loop(id: u64, mut stream: UnixStream, state: Arc<MasterState>) {
                 attach_result
                     .and_then(|_| decode_size(&payload))
                     .and_then(|size| state.resize(to_winsize(size)))
-                    .map(|resized| {
-                        // A changed size already makes the application repaint,
-                        // so only ask for a redraw when it did not.
-                        if !resized {
-                            state.request_redraw();
-                        }
-                    })
+                    .map(|_| ())
             }
             FRAME_INPUT if attached => state.write_input(&payload),
             FRAME_RESIZE if attached => decode_size(&payload)
@@ -862,8 +829,40 @@ fn client_loop(id: u64, mut stream: UnixStream, state: Arc<MasterState>) {
     writer.close();
 }
 
+/// Drops the leftovers of sessions nobody came back for. A master that exits
+/// cleanly removes its own directory; one that goes down with the machine
+/// cannot, and what it leaves behind - cwd, boot id, scrollback - is only
+/// kept so the next attach can restore from it. Swept from `list` because
+/// that is the command the app runs regularly, and never on a hot path.
+fn sweep_abandoned_sessions(base: &Path) {
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        // A live master answers on its socket, whatever the timestamps say.
+        if UnixStream::connect(path.join("control.sock")).is_ok() {
+            continue;
+        }
+        let modified = fs::metadata(path.join("scrollback"))
+            .or_else(|_| fs::metadata(path.join("created_at")))
+            .or_else(|_| fs::metadata(&path))
+            .and_then(|metadata| metadata.modified());
+        if let Ok(modified) = modified
+            && crate::is_abandoned(modified, now)
+        {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
 pub(crate) fn list_command() -> io::Result<()> {
     let base = prepare_base_dir()?;
+    sweep_abandoned_sessions(&base);
     let mut directories = fs::read_dir(base)?
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
@@ -1123,9 +1122,12 @@ fn spawn_persistence_thread(state: Arc<MasterState>) {
             }
             thread::sleep(CWD_POLL_INTERVAL);
             tick += 1;
+            // The first tick flushes too: a session that dies before the
+            // first full interval - a power cut minutes in is rare, seconds
+            // in is not - would otherwise have no scrollback on disk at all.
             state.flush_restore_state(
                 &mut last_cwd,
-                tick.is_multiple_of(SCROLLBACK_FLUSH_EVERY_TICKS),
+                tick == 1 || tick.is_multiple_of(SCROLLBACK_FLUSH_EVERY_TICKS),
             );
         }
     });
@@ -1186,7 +1188,7 @@ fn spawn_client_persistence_thread(name: String, scrollback: Arc<Mutex<VecDeque<
                 let _ = fs::write(directory.join("cwd"), cwd.as_os_str().as_bytes());
                 last_cwd = Some(cwd);
             }
-            if tick.is_multiple_of(SCROLLBACK_FLUSH_EVERY_TICKS) {
+            if tick == 1 || tick.is_multiple_of(SCROLLBACK_FLUSH_EVERY_TICKS) {
                 let snapshot: Vec<u8> = scrollback
                     .lock()
                     .expect("scrollback mutex poisoned")

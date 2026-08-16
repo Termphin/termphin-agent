@@ -19,9 +19,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING,
-    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-    LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
+    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION,
@@ -32,10 +31,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::Console::{
-    COORD, CONSOLE_SCREEN_BUFFER_INFO, ClosePseudoConsole, CreatePseudoConsole,
-    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, HPCON, ResizePseudoConsole,
-    SetConsoleMode, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    CONSOLE_SCREEN_BUFFER_INFO, COORD, ClosePseudoConsole, CreatePseudoConsole,
+    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode,
+    GetConsoleScreenBufferInfo, GetStdHandle, HPCON, ResizePseudoConsole, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE, SetConsoleMode,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
@@ -51,15 +50,15 @@ use windows_sys::Win32::System::Threading::{
     STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
+use crate::win32_codec::{CWD_PROMPT_HOOK, Win32InputDecoder, base64_utf16le};
 use crate::{
     CLIENT_WRITE_TIMEOUT, ClientQueue, FRAME_ATTACH, FRAME_ERROR, FRAME_EXIT, FRAME_HISTORY,
-    FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_REPLAY_DONE, FRAME_RESIZE,
-    FRAME_RENAME, FRAME_STATUS, FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT, History, MAX_CLIENTS,
+    FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_RENAME, FRAME_REPLAY_DONE, FRAME_RESIZE,
+    FRAME_STATUS, FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT, History, MAX_CLIENTS,
     REPLAY_CHUNK_SIZE, REPLAY_END_MARKER, RestoreState, SCROLLBACK_FLUSH_EVERY_TICKS, TermSize,
     append_scrollback, decode_size, encode_size, invalid_input, read_frame, send_frame,
     validate_name,
 };
-use crate::win32_codec::{CWD_PROMPT_HOOK, Win32InputDecoder, base64_utf16le};
 
 /// Ten cheap console reads a second, against a visible lag on every rotation
 /// and keyboard toggle if it were longer.
@@ -78,8 +77,8 @@ fn win_bool(value: i32) -> bool {
 }
 
 fn base_dir() -> io::Result<PathBuf> {
-    let local = env::var_os("LOCALAPPDATA")
-        .ok_or_else(|| invalid_input("LOCALAPPDATA is not set"))?;
+    let local =
+        env::var_os("LOCALAPPDATA").ok_or_else(|| invalid_input("LOCALAPPDATA is not set"))?;
     Ok(PathBuf::from(local).join("termphin").join("sessions"))
 }
 
@@ -271,22 +270,27 @@ impl AsyncPipe {
             unsafe {
                 CancelIoEx(self.handle, overlapped);
             }
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "pipe I/O timed out"));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "pipe I/O timed out",
+            ));
         }
         if wait != WAIT_OBJECT_0 {
             return Err(last_error());
         }
         let mut transferred = 0u32;
-        let ok = unsafe {
-            GetOverlappedResult(self.handle, overlapped, &mut transferred, 0)
-        };
+        let ok = unsafe { GetOverlappedResult(self.handle, overlapped, &mut transferred, 0) };
         if !win_bool(ok) {
             return Err(last_error());
         }
         Ok(transferred as usize)
     }
 
-    pub(crate) fn write_all_timeout(&self, mut buf: &[u8], timeout_ms: Option<u32>) -> io::Result<()> {
+    pub(crate) fn write_all_timeout(
+        &self,
+        mut buf: &[u8],
+        timeout_ms: Option<u32>,
+    ) -> io::Result<()> {
         while !buf.is_empty() {
             let written = self.write_once(buf, timeout_ms)?;
             if written == 0 {
@@ -297,7 +301,11 @@ impl AsyncPipe {
         Ok(())
     }
 
-    pub(crate) fn read_exact_timeout(&self, mut buf: &mut [u8], timeout_ms: Option<u32>) -> io::Result<()> {
+    pub(crate) fn read_exact_timeout(
+        &self,
+        mut buf: &mut [u8],
+        timeout_ms: Option<u32>,
+    ) -> io::Result<()> {
         while !buf.is_empty() {
             let read = self.read_once(buf, timeout_ms)?;
             if read == 0 {
@@ -502,13 +510,18 @@ struct CreationLock {
 
 impl CreationLock {
     fn acquire() -> io::Result<Self> {
-        let name = to_wide(&format!(r"Local\termphin-agent-{}-creation-lock", username()));
+        let name = to_wide(&format!(
+            r"Local\termphin-agent-{}-creation-lock",
+            username()
+        ));
         let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
         if handle.is_null() {
             return Err(last_error());
         }
         let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
-        if wait != WAIT_OBJECT_0 && wait != 0x80 /* WAIT_ABANDONED */ {
+        if wait != WAIT_OBJECT_0 && wait != 0x80
+        /* WAIT_ABANDONED */
+        {
             unsafe { CloseHandle(handle) };
             return Err(io::Error::other("failed to acquire creation lock"));
         }
@@ -561,12 +574,7 @@ fn create_pipe_pair() -> io::Result<(HANDLE, HANDLE)> {
     let mut read: HANDLE = std::ptr::null_mut();
     let mut write: HANDLE = std::ptr::null_mut();
     let ok = unsafe {
-        windows_sys::Win32::System::Pipes::CreatePipe(
-            &mut read,
-            &mut write,
-            std::ptr::null(),
-            0,
-        )
+        windows_sys::Win32::System::Pipes::CreatePipe(&mut read, &mut write, std::ptr::null(), 0)
     };
     if !win_bool(ok) {
         return Err(last_error());
@@ -588,7 +596,9 @@ fn shell_command_line() -> String {
 
 /// Returns the pseudo console, the write end of its input pipe, the read end
 /// of its output pipe, and the shell process attached to it.
-fn spawn_conpty_shell(size: TermSize) -> io::Result<(PseudoConsole, SyncPipe, SyncPipe, ChildProcess)> {
+fn spawn_conpty_shell(
+    size: TermSize,
+) -> io::Result<(PseudoConsole, SyncPipe, SyncPipe, ChildProcess)> {
     let (pty_in_read, pty_in_write) = create_pipe_pair()?;
     let (pty_out_read, pty_out_write) = create_pipe_pair()?;
 
@@ -814,7 +824,7 @@ struct MasterState {
 
 impl MasterState {
     fn add_client(&self, id: u64, channel: Arc<ClientChannel>, replay: bool) -> io::Result<()> {
-        let history = self.history.lock().expect("history mutex poisoned");
+        let mut history = self.history.lock().expect("history mutex poisoned");
         if replay {
             for chunk in history.snapshot().chunks(REPLAY_CHUNK_SIZE) {
                 channel.send(FRAME_OUTPUT, chunk)?;
@@ -875,58 +885,23 @@ impl MasterState {
             Y: size.rows as i16,
         };
         let result = unsafe {
-            ResizePseudoConsole(self.pseudo_console.lock().expect("pty mutex poisoned").handle, coord)
+            ResizePseudoConsole(
+                self.pseudo_console
+                    .lock()
+                    .expect("pty mutex poisoned")
+                    .handle,
+                coord,
+            )
         };
         if result != 0 {
             return Err(io::Error::from_raw_os_error(result));
         }
-        *current = size;
-        Ok(true)
-    }
-
-    /// Briefly shrinks the pseudo console by one row to force a full-screen
-    /// app to repaint on a same-size reattach - the alternate buffer has no
-    /// scrollback to replay otherwise.
-    fn request_redraw(&self) {
-        if !self
-            .history
+        self.history
             .lock()
             .expect("history mutex poisoned")
-            .alternate_screen_active()
-        {
-            return;
-        }
-        let size = *self.size.lock().expect("size mutex poisoned");
-        if size.rows < 2 {
-            return;
-        }
-        let shrunk = TermSize {
-            cols: size.cols,
-            rows: size.rows - 1,
-        };
-        let handle = self.pseudo_console.lock().expect("pty mutex poisoned").handle;
-        let shrink = unsafe {
-            ResizePseudoConsole(
-                handle,
-                COORD {
-                    X: shrunk.cols as i16,
-                    Y: shrunk.rows as i16,
-                },
-            )
-        };
-        if shrink != 0 {
-            return;
-        }
-        thread::sleep(Duration::from_millis(40));
-        unsafe {
-            ResizePseudoConsole(
-                handle,
-                COORD {
-                    X: size.cols as i16,
-                    Y: size.rows as i16,
-                },
-            );
-        }
+            .resize(size.rows, size.cols);
+        *current = size;
+        Ok(true)
     }
 
     fn status(&self) -> String {
@@ -984,7 +959,12 @@ impl MasterState {
             return;
         }
         unsafe {
-            ClosePseudoConsole(self.pseudo_console.lock().expect("pty mutex poisoned").handle);
+            ClosePseudoConsole(
+                self.pseudo_console
+                    .lock()
+                    .expect("pty mutex poisoned")
+                    .handle,
+            );
         }
     }
 
@@ -1059,16 +1039,12 @@ fn client_loop(id: u64, pipe: AsyncPipe, state: Arc<MasterState>) {
                 attach_result
                     .and_then(|_| decode_size(&payload))
                     .and_then(|size| state.resize(size))
-                    .map(|resized| {
-                        if !resized {
-                            state.request_redraw();
-                        }
-                    })
+                    .map(|_| ())
             }
             FRAME_INPUT if attached => state.write_input(&payload),
-            FRAME_RESIZE if attached => {
-                decode_size(&payload).and_then(|size| state.resize(size)).map(|_| ())
-            }
+            FRAME_RESIZE if attached => decode_size(&payload)
+                .and_then(|size| state.resize(size))
+                .map(|_| ()),
             FRAME_STATUS => writer.send(FRAME_STATUS_RESPONSE, state.status().as_bytes()),
             FRAME_RENAME => match String::from_utf8(payload) {
                 Ok(name) => state
@@ -1108,13 +1084,18 @@ fn install_master_panic_log(directory: PathBuf) {
 }
 
 fn log_master_error(directory: &std::path::Path, error: io::Error) -> io::Error {
-    let _ = std::fs::write(directory.join("master.log"), format!("startup failed: {error}\n"));
+    let _ = std::fs::write(
+        directory.join("master.log"),
+        format!("startup failed: {error}\n"),
+    );
     error
 }
 
 /// Entry point for `termphin-agent __master <name> <cols> <rows>`.
 pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Result<()> {
-    let name = args.next().ok_or_else(|| invalid_input("missing session name"))?;
+    let name = args
+        .next()
+        .ok_or_else(|| invalid_input("missing session name"))?;
     let cols: u16 = args
         .next()
         .and_then(|value| value.parse().ok())
@@ -1131,8 +1112,8 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
     let directory_log = directory.clone();
     let restore = RestoreState::load(&directory, current_boot_id().as_deref());
 
-    let (pseudo_console, pty_write, pty_read, child) = spawn_conpty_shell(size)
-        .map_err(|error| log_master_error(&directory_log, error))?;
+    let (pseudo_console, pty_write, pty_read, child) =
+        spawn_conpty_shell(size).map_err(|error| log_master_error(&directory_log, error))?;
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1143,9 +1124,9 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
         let _ = std::fs::write(directory.join("boot_id"), &id);
     }
 
-    let mut history = History::default();
-    if restore.reboot_restored && !restore.scrollback.is_empty() {
-        history.seed_restored(&restore.scrollback);
+    let mut history = History::new(size.rows, size.cols);
+    if restore.restored {
+        history.seed_restored(&restore.scrollback, restore.reboot_restored);
     }
 
     let state = Arc::new(MasterState {
@@ -1186,13 +1167,15 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
                 return;
             }
             tick += 1;
-            if tick.is_multiple_of(SCROLLBACK_FLUSH_EVERY_TICKS) {
+            // First tick included: see the same loop in `unix.rs`.
+            if tick == 1 || tick.is_multiple_of(SCROLLBACK_FLUSH_EVERY_TICKS) {
                 persistence_state.flush_scrollback();
             }
         }
     });
 
-    let security = OwnerOnlySecurity::new().map_err(|error| log_master_error(&directory_log, error))?;
+    let security =
+        OwnerOnlySecurity::new().map_err(|error| log_master_error(&directory_log, error))?;
     static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
     let active_clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     loop {
@@ -1255,7 +1238,10 @@ fn spawn_detached(command_line: &str) -> io::Result<()> {
         startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
         let mut process_info: PROCESS_INFORMATION = std::mem::zeroed();
         let mut wide_cmd = to_wide(command_line);
-        let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW;
+        let flags = DETACHED_PROCESS
+            | CREATE_NEW_PROCESS_GROUP
+            | CREATE_BREAKAWAY_FROM_JOB
+            | CREATE_NO_WINDOW;
         let ok = CreateProcessW(
             std::ptr::null(),
             wide_cmd.as_mut_ptr(),
@@ -1339,8 +1325,42 @@ fn connect_or_create(name: &str, size: TermSize) -> io::Result<AsyncPipe> {
     ))
 }
 
+/// The Windows half of the sweep in `unix.rs`, with a named pipe standing in
+/// for the control socket as the proof that a master is still alive.
+fn sweep_abandoned_sessions(base: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        // A live master answers on its pipe, whatever the timestamps say.
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| try_connect(name).is_ok())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let modified = std::fs::metadata(path.join("scrollback"))
+            .or_else(|_| std::fs::metadata(path.join("created_at")))
+            .or_else(|_| std::fs::metadata(&path))
+            .and_then(|metadata| metadata.modified());
+        if let Ok(modified) = modified
+            && crate::is_abandoned(modified, now)
+        {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
 pub(crate) fn list_command() -> io::Result<()> {
     let base = prepare_base_dir()?;
+    sweep_abandoned_sessions(&base);
     let mut directories = std::fs::read_dir(base)?
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
@@ -1535,7 +1555,9 @@ fn bridge_terminal(
                 if replay_requested && !painted {
                     return Ok(Attachment::ReplayRejected);
                 }
-                return Err(io::Error::other(String::from_utf8_lossy(&message).into_owned()));
+                return Err(io::Error::other(
+                    String::from_utf8_lossy(&message).into_owned(),
+                ));
             }
             _ => {}
         }
@@ -1562,7 +1584,10 @@ impl ConsoleRawMode {
         if has_console {
             unsafe {
                 SetConsoleMode(stdin, ENABLE_VIRTUAL_TERMINAL_INPUT);
-                SetConsoleMode(stdout, original_output_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+                SetConsoleMode(
+                    stdout,
+                    original_output_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                );
             }
         }
         Ok(Self {
