@@ -54,14 +54,56 @@ fn session_dir(name: &str) -> io::Result<PathBuf> {
     Ok(base_dir()?.join(name))
 }
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn proc_listchildpids(
+        pid: libc::pid_t,
+        buffer: *mut libc::c_void,
+        buffersize: libc::c_int,
+    ) -> libc::c_int;
+    fn termphin_agent_shell_cwd(
+        pid: libc::pid_t,
+        out: *mut libc::c_char,
+        out_len: libc::c_int,
+    ) -> libc::c_int;
+}
+
+#[cfg(not(target_os = "macos"))]
 fn current_boot_id() -> Option<String> {
     fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
         .map(|s| s.trim().to_owned())
 }
 
+#[cfg(target_os = "macos")]
+fn current_boot_id() -> Option<String> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+    let mut boottime: libc::timeval = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of::<libc::timeval>();
+    let result = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            (&raw mut boottime).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (result == 0).then(|| boottime.tv_sec.to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
 fn shell_cwd(pid: libc::pid_t) -> Option<PathBuf> {
     fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn shell_cwd(pid: libc::pid_t) -> Option<PathBuf> {
+    let mut buf = [0_u8; 1024];
+    let n =
+        unsafe { termphin_agent_shell_cwd(pid, buf.as_mut_ptr().cast(), buf.len() as libc::c_int) };
+    (n > 0).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..n as usize])))
 }
 
 fn socket_path(name: &str) -> io::Result<PathBuf> {
@@ -193,11 +235,66 @@ fn connect_or_create(name: &str, size: libc::winsize) -> io::Result<UnixStream> 
     ))
 }
 
-fn spawn_master(name: &str, size: libc::winsize, restore: RestoreState) -> io::Result<()> {
+#[cfg(not(target_os = "macos"))]
+fn cloexec_pipe() -> io::Result<[RawFd; 2]> {
     let mut pipe_fds = [0; 2];
     if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(pipe_fds)
+}
+
+#[cfg(target_os = "macos")]
+fn cloexec_pipe() -> io::Result<[RawFd; 2]> {
+    let mut pipe_fds = [0; 2];
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for fd in pipe_fds {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(pipe_fds)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn call_openpty(
+    master_fd: &mut libc::c_int,
+    slave_fd: &mut libc::c_int,
+    size: &libc::winsize,
+) -> libc::c_int {
+    let mut size = *size;
+    unsafe {
+        libc::openpty(
+            master_fd,
+            slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+unsafe fn call_openpty(
+    master_fd: &mut libc::c_int,
+    slave_fd: &mut libc::c_int,
+    size: &libc::winsize,
+) -> libc::c_int {
+    unsafe {
+        libc::openpty(
+            master_fd,
+            slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            size,
+        )
+    }
+}
+
+fn spawn_master(name: &str, size: libc::winsize, restore: RestoreState) -> io::Result<()> {
+    let pipe_fds = cloexec_pipe()?;
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -240,16 +337,7 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
 
         let mut master_fd = -1;
         let mut slave_fd = -1;
-        if unsafe {
-            libc::openpty(
-                &mut master_fd,
-                &mut slave_fd,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                &size,
-            )
-        } != 0
-        {
+        if unsafe { call_openpty(&mut master_fd, &mut slave_fd, &size) } != 0 {
             return Err(io::Error::last_os_error());
         }
 
@@ -1133,6 +1221,7 @@ fn spawn_persistence_thread(state: Arc<MasterState>) {
     });
 }
 
+#[cfg(not(target_os = "macos"))]
 fn peer_pid(stream: &UnixStream) -> Option<libc::pid_t> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -1148,9 +1237,43 @@ fn peer_pid(stream: &UnixStream) -> Option<libc::pid_t> {
     (result == 0).then_some(cred.pid)
 }
 
+#[cfg(target_os = "macos")]
+fn peer_pid(stream: &UnixStream) -> Option<libc::pid_t> {
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&raw mut pid).cast(),
+            &mut len,
+        )
+    };
+    (result == 0).then_some(pid)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn child_pid_of(pid: libc::pid_t) -> Option<libc::pid_t> {
     let content = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).ok()?;
     content.split_whitespace().next()?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn child_pid_of(pid: libc::pid_t) -> Option<libc::pid_t> {
+    let mut children = [0 as libc::pid_t; 8];
+    let bytes = unsafe {
+        proc_listchildpids(
+            pid,
+            children.as_mut_ptr().cast(),
+            (children.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int,
+        )
+    };
+    if bytes <= 0 {
+        return None;
+    }
+    let count = (bytes as usize / std::mem::size_of::<libc::pid_t>()).min(children.len());
+    children[..count].first().copied()
 }
 
 fn client_side_shell_pid(name: &str) -> Option<libc::pid_t> {
