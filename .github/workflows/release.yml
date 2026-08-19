@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+jobs:
+  linux-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-windows
+          path: |
+            dist/termphin-agent-x86_64
+            dist/termphin-agent-aarch64
+            dist/termphin-agent-windows-x86_64.exe
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            suffix: x86_64
+          - target: aarch64-apple-darwin
+            suffix: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Package and ad-hoc sign
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/termphin-agent" \
+            "dist/termphin-agent-macos-${{ matrix.suffix }}"
+          codesign --force --sign - "dist/termphin-agent-macos-${{ matrix.suffix }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos-${{ matrix.suffix }}
+          path: dist/termphin-agent-macos-${{ matrix.suffix }}
+          if-no-files-found: error
+
+  release:
+    needs: [linux-windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Merge artifacts and build manifest
+        run: |
+          mkdir -p dist
+          find artifacts -type f -exec cp {} dist/ \;
+          chmod +x dist/termphin-agent-x86_64 dist/termphin-agent-aarch64 \
+            dist/termphin-agent-macos-x86_64 dist/termphin-agent-macos-aarch64
+          scripts/make_manifest.sh dist
+      - name: Create release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* \
+            --title "${{ github.ref_name }}" \
+            --notes "termphin-agent ${{ github.ref_name }}"

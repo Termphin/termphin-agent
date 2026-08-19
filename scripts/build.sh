@@ -33,24 +33,4 @@ cp "$ROOT/target/aarch64-unknown-linux-musl/release/termphin-agent" \
 cp "$ROOT/target/x86_64-pc-windows-gnu/release/termphin-agent.exe" \
   "$DIST/termphin-agent-windows-x86_64.exe"
 
-VERSION="$("$DIST/termphin-agent-x86_64" version --machine | awk -F= '$1 == "version" { print $2 }')"
-PROTOCOL="$("$DIST/termphin-agent-x86_64" version --machine | awk -F= '$1 == "protocol" { print $2 }')"
-X86_SHA="$(sha256sum "$DIST/termphin-agent-x86_64" | cut -d' ' -f1)"
-ARM_SHA="$(sha256sum "$DIST/termphin-agent-aarch64" | cut -d' ' -f1)"
-WINDOWS_SHA="$(sha256sum "$DIST/termphin-agent-windows-x86_64.exe" | cut -d' ' -f1)"
-
-cat > "$DIST/manifest.properties" <<EOF
-version=$VERSION
-protocol=$PROTOCOL
-x86_64.file=termphin-agent-x86_64
-x86_64.sha256=$X86_SHA
-aarch64.file=termphin-agent-aarch64
-aarch64.sha256=$ARM_SHA
-windows_x86_64.file=termphin-agent-windows-x86_64.exe
-windows_x86_64.sha256=$WINDOWS_SHA
-EOF
-
-printf 'Built termphin-agent %s (protocol %s)\n' "$VERSION" "$PROTOCOL"
-printf '  x86_64          %s\n' "$X86_SHA"
-printf '  aarch64         %s\n' "$ARM_SHA"
-printf '  windows_x86_64  %s\n' "$WINDOWS_SHA"
+"$ROOT/scripts/make_manifest.sh" "$DIST"
