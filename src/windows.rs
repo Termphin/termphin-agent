@@ -1107,10 +1107,16 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
     let size = TermSize { cols, rows };
 
     let directory = session_dir(&name)?;
+    // `connect_or_create` already created the directory, so only `created_at`
+    // tells a rebuilt session from a new one.
+    let restore = if directory.join("created_at").exists() {
+        RestoreState::load(&directory, current_boot_id().as_deref())
+    } else {
+        RestoreState::default()
+    };
     std::fs::create_dir_all(&directory)?;
     install_master_panic_log(directory.clone());
     let directory_log = directory.clone();
-    let restore = RestoreState::load(&directory, current_boot_id().as_deref());
 
     let (pseudo_console, pty_write, pty_read, child) =
         spawn_conpty_shell(size).map_err(|error| log_master_error(&directory_log, error))?;
