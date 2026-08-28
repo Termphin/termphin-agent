@@ -17,7 +17,6 @@ mod win32_codec;
 
 pub(crate) const PROTOCOL_VERSION: u32 = 1;
 pub(crate) const MAX_FRAME_SIZE: usize = 1024 * 1024;
-pub(crate) const HISTORY_SIZE: usize = 256 * 1024;
 
 pub(crate) const REPLAY_CHUNK_SIZE: usize = 128 * 1024;
 
@@ -373,14 +372,6 @@ pub(crate) struct ClientQueue {
     pub(crate) frames: VecDeque<(u8, Vec<u8>)>,
     pub(crate) bytes: usize,
     pub(crate) closed: bool,
-}
-
-pub(crate) fn append_scrollback(scrollback: &std::sync::Mutex<VecDeque<u8>>, data: &[u8]) {
-    let mut buf = scrollback.lock().expect("scrollback mutex poisoned");
-    buf.extend(data);
-    while buf.len() > HISTORY_SIZE {
-        buf.pop_front();
-    }
 }
 
 #[cfg(test)]

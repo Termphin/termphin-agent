@@ -9,7 +9,7 @@
 //! `ENABLE_VIRTUAL_TERMINAL_INPUT` consumes the same input-record queue that
 //! would otherwise deliver `WINDOW_BUFFER_SIZE_EVENT`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::env;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -56,8 +56,7 @@ use crate::{
     FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_RENAME, FRAME_REPLAY_DONE, FRAME_RESIZE,
     FRAME_STATUS, FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT, History, MAX_CLIENTS,
     REPLAY_CHUNK_SIZE, REPLAY_END_MARKER, RestoreState, SCROLLBACK_FLUSH_EVERY_TICKS, TermSize,
-    append_scrollback, decode_size, encode_size, invalid_input, read_frame, send_frame,
-    validate_name,
+    decode_size, encode_size, invalid_input, read_frame, send_frame, validate_name,
 };
 
 /// Ten cheap console reads a second, against a visible lag on every rotation
@@ -477,7 +476,7 @@ fn try_connect(name: &str) -> io::Result<AsyncPipe> {
         return Ok(AsyncPipe::from_raw(handle));
     }
     let error = unsafe { GetLastError() };
-    if error == ERROR_PIPE_BUSY as u32 {
+    if error == ERROR_PIPE_BUSY {
         let wide = to_wide(&pipe_path(name));
         unsafe { WaitNamedPipeW(wide.as_ptr(), 2000) };
         return try_connect_once(name);
@@ -1412,14 +1411,13 @@ fn control_command(name: &str, kind: u8, payload: &[u8]) -> io::Result<()> {
 
 pub(crate) fn attach_command(name: &str, replay: bool) -> io::Result<()> {
     let _raw_mode = ConsoleRawMode::enable()?;
-    let scrollback = Arc::new(Mutex::new(VecDeque::new()));
 
     if !replay {
-        try_attach(name, false, &scrollback)?;
+        try_attach(name, false)?;
         return Ok(());
     }
-    if try_attach(name, true, &scrollback)? == Attachment::ReplayRejected {
-        try_attach(name, false, &scrollback)?;
+    if try_attach(name, true)? == Attachment::ReplayRejected {
+        try_attach(name, false)?;
     }
     Ok(())
 }
@@ -1441,18 +1439,14 @@ fn console_size() -> TermSize {
     TermSize { cols: 80, rows: 24 }
 }
 
-fn try_attach(
-    name: &str,
-    replay: bool,
-    scrollback: &Arc<Mutex<VecDeque<u8>>>,
-) -> io::Result<Attachment> {
+fn try_attach(name: &str, replay: bool) -> io::Result<Attachment> {
     let size = console_size();
     let pipe = connect_or_create(name, size)?;
     if replay {
         send_frame(&mut &pipe, FRAME_HISTORY, &[])?;
     }
     send_frame(&mut &pipe, FRAME_ATTACH, &encode_size(size))?;
-    bridge_terminal(pipe, size, replay, scrollback)
+    bridge_terminal(pipe, size, replay)
 }
 
 impl Read for &AsyncPipe {
@@ -1476,7 +1470,6 @@ fn bridge_terminal(
     pipe: AsyncPipe,
     initial_size: TermSize,
     replay_requested: bool,
-    scrollback: &Arc<Mutex<VecDeque<u8>>>,
 ) -> io::Result<Attachment> {
     let pipe = Arc::new(pipe);
     let input_pipe = Arc::clone(&pipe);
@@ -1543,7 +1536,6 @@ fn bridge_terminal(
         match frame {
             (FRAME_OUTPUT, data) => {
                 painted = true;
-                append_scrollback(scrollback, &data);
                 output.write_all(&data)?;
                 output.flush()?;
             }

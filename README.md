@@ -26,11 +26,12 @@ The part worth reading before letting anything run on a machine you care about.
 - **It starts your `$SHELL`** (or `/bin/sh`) as a login shell on a PTY, and
   passes bytes between that PTY and the socket unchanged. On Windows that's
   `powershell.exe` on a ConPTY pseudo console instead.
-- **Scrollback is held in memory only**, a 256 KiB ring per session. It is
-  never written to disk, except a periodic snapshot so a reboot can restore it.
-- **One dependency on Unix**, `libc`, in about 1400 lines of one file, small
-  enough to read in an afternoon. Windows needs `windows-sys` for ConPTY and
-  named pipes and is a separate module.
+- **Scrollback is held in memory only**, the last 2000 rows of the session's
+  terminal state. It is never written to disk, except a periodic snapshot so a
+  reboot can restore it.
+- **Two dependencies on Unix**, `libc` and `vt100`, over about 1400 lines of
+  one file, small enough to read in an afternoon. Windows needs `windows-sys`
+  for ConPTY and named pipes and is a separate module.
 
 Authorization is the filesystem (or, on Windows, the pipe's ACL). Anyone who
 can reach it is already running as your user, and could read the PTY anyway.
@@ -62,8 +63,8 @@ termphin-agent version --machine
 
 Each session has a master process and a Unix socket below
 `~/.cache/termphin/sessions`. The attach client forwards terminal resize events
-to the child PTY. The master retains 256 KiB of raw output and tracks the
-active DEC private terminal modes.
+to the child PTY. The master keeps the session's terminal state - 2000 rows of
+scrollback, the screen, and the active DEC private terminal modes.
 
 `--replay` reconstructs a fresh local terminal's scrollback and modes. The
 buffer is sent as a series of frames, since it can exceed the 1 MiB protocol

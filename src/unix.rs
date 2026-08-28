@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::env;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -19,8 +19,8 @@ use crate::{
     FRAME_HISTORY, FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_RENAME,
     FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_STATUS, FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT,
     History, MAX_CLIENTS, REPLAY_CHUNK_SIZE, REPLAY_END_MARKER, RestoreState,
-    SCROLLBACK_FLUSH_EVERY_TICKS, TermSize, append_scrollback, decode_size, encode_size,
-    invalid_input, read_frame, send_frame, validate_name,
+    SCROLLBACK_FLUSH_EVERY_TICKS, TermSize, decode_size, encode_size, invalid_input, read_frame,
+    send_frame, validate_name,
 };
 
 static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
@@ -56,11 +56,6 @@ fn session_dir(name: &str) -> io::Result<PathBuf> {
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
-    fn proc_listchildpids(
-        pid: libc::pid_t,
-        buffer: *mut libc::c_void,
-        buffersize: libc::c_int,
-    ) -> libc::c_int;
     fn termphin_agent_shell_cwd(
         pid: libc::pid_t,
         out: *mut libc::c_char,
@@ -153,27 +148,21 @@ impl Drop for CreationLock {
 pub(crate) fn attach_command(name: &str, replay: bool) -> io::Result<()> {
     install_attach_signal_handlers()?;
     let _raw_mode = RawModeGuard::enable(libc::STDIN_FILENO)?;
-    let scrollback = Arc::new(Mutex::new(VecDeque::new()));
-    spawn_client_persistence_thread(name.to_owned(), Arc::clone(&scrollback));
 
     if !replay {
-        try_attach(name, false, &scrollback)?;
+        try_attach(name, false)?;
         return Ok(());
     }
-    if try_attach(name, true, &scrollback)? == Attachment::ReplayRejected {
+    if try_attach(name, true)? == Attachment::ReplayRejected {
         // Masters started by an older build refuse a history larger than one
         // frame. Reaching a session without its scrollback beats refusing to
         // reach it at all, so drop the replay and attach again.
-        try_attach(name, false, &scrollback)?;
+        try_attach(name, false)?;
     }
     Ok(())
 }
 
-fn try_attach(
-    name: &str,
-    replay: bool,
-    scrollback: &Arc<Mutex<VecDeque<u8>>>,
-) -> io::Result<Attachment> {
+fn try_attach(name: &str, replay: bool) -> io::Result<Attachment> {
     let size = terminal_size(libc::STDIN_FILENO);
     let mut stream = connect_or_create(name, size)?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -184,7 +173,7 @@ fn try_attach(
         send_frame(&mut stream, FRAME_HISTORY, &[])?;
     }
     send_frame(&mut stream, FRAME_ATTACH, &encode_size(from_winsize(size)))?;
-    bridge_terminal(stream, replay, scrollback)
+    bridge_terminal(stream, replay)
 }
 
 #[derive(PartialEq, Eq)]
@@ -196,14 +185,38 @@ enum Attachment {
     ReplayRejected,
 }
 
+/// What trying a session's control socket said about its master. Only
+/// [`Probe::Absent`] means the directory is leftovers - reading a connection
+/// that merely failed as absence would delete a live session and start a
+/// second master on its name.
+enum Probe {
+    Listening(UnixStream),
+    Absent,
+    Unknown(io::Error),
+}
+
+fn probe_socket(path: &Path) -> Probe {
+    match UnixStream::connect(path) {
+        Ok(stream) => Probe::Listening(stream),
+        Err(error) => match error.kind() {
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound => Probe::Absent,
+            _ => Probe::Unknown(error),
+        },
+    }
+}
+
 fn connect_or_create(name: &str, size: libc::winsize) -> io::Result<UnixStream> {
-    if let Ok(stream) = UnixStream::connect(socket_path(name)?) {
-        return Ok(stream);
+    match probe_socket(&socket_path(name)?) {
+        Probe::Listening(stream) => return Ok(stream),
+        Probe::Unknown(error) => return Err(error),
+        Probe::Absent => {}
     }
 
     let lock = CreationLock::acquire()?;
-    if let Ok(stream) = UnixStream::connect(socket_path(name)?) {
-        return Ok(stream);
+    match probe_socket(&socket_path(name)?) {
+        Probe::Listening(stream) => return Ok(stream),
+        Probe::Unknown(error) => return Err(error),
+        Probe::Absent => {}
     }
 
     let directory = session_dir(name)?;
@@ -308,13 +321,48 @@ fn spawn_master(name: &str, size: libc::winsize, restore: RestoreState) -> io::R
     }
 
     close_fd(pipe_fds[1]);
-    let mut ready = [0_u8; 1];
-    let read = unsafe { libc::read(pipe_fds[0], ready.as_mut_ptr().cast(), 1) };
+    let ready = read_ready_within(pipe_fds[0], MASTER_READY_TIMEOUT_MS);
     close_fd(pipe_fds[0]);
-    if read == 1 && ready[0] == 1 {
+    if ready {
         Ok(())
     } else {
         Err(io::Error::other("session master failed to initialize"))
+    }
+}
+
+const MASTER_READY_TIMEOUT_MS: libc::c_int = 10_000;
+
+/// Reads the one readiness byte. Finite on purpose: the caller is an SSH
+/// command with a user waiting, so a master stuck before it could answer has
+/// to fail the attach rather than hang it.
+fn read_ready_within(fd: RawFd, timeout_ms: libc::c_int) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    loop {
+        let remaining = match deadline.checked_duration_since(Instant::now()) {
+            Some(remaining) => remaining.as_millis() as libc::c_int,
+            None => return false,
+        };
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut poll_fd, 1, remaining) } {
+            0 => return false,
+            count if count < 0 => {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return false;
+            }
+            _ => {}
+        }
+        let mut ready = [0_u8; 1];
+        let read = unsafe { libc::read(fd, ready.as_mut_ptr().cast(), 1) };
+        if read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return read == 1 && ready[0] == 1;
     }
 }
 
@@ -379,7 +427,8 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
             pty: Mutex::new(writer),
             clients: Mutex::new(HashMap::new()),
             history: Mutex::new(history),
-            terminating: AtomicBool::new(false),
+            shell_killed: AtomicBool::new(false),
+            exiting: AtomicBool::new(false),
         });
         spawn_persistence_thread(Arc::clone(&state));
         Ok((listener, reader, state))
@@ -665,7 +714,11 @@ struct MasterState {
     pty: Mutex<File>,
     clients: Mutex<HashMap<u64, Arc<ClientChannel>>>,
     history: Mutex<History>,
-    terminating: AtomicBool,
+    /// Separate from [`Self::exiting`] on purpose: sharing one flag meant an
+    /// explicit `kill` marked the session wound down, and [`Self::finish`]
+    /// then skipped both the exit frame and the drain of the last output.
+    shell_killed: AtomicBool,
+    exiting: AtomicBool,
 }
 
 impl MasterState {
@@ -766,18 +819,21 @@ impl MasterState {
         let mut directory = self.directory.lock().expect("directory mutex poisoned");
         let destination = base_dir()?.join(new_name);
         if destination.exists() {
-            if UnixStream::connect(destination.join("control.sock")).is_ok() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "session name is already in use",
-                ));
+            match probe_socket(&destination.join("control.sock")) {
+                Probe::Listening(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "session name is already in use",
+                    ));
+                }
+                Probe::Unknown(error) => return Err(error),
+                // A directory left behind by a session that never shut down
+                // cleanly (SIGKILL, power loss, ...) - nothing is listening on
+                // its socket, so the name is free to reclaim rather than stuck
+                // forever. Mirrors the same self-heal `connect_or_create` does
+                // on attach.
+                Probe::Absent => fs::remove_dir_all(&destination)?,
             }
-            // A directory left behind by a session that never shut down
-            // cleanly (SIGKILL, power loss, ...) - nothing is listening on
-            // its socket, so the name is free to reclaim rather than stuck
-            // forever. Mirrors the same self-heal `connect_or_create` does
-            // on attach.
-            fs::remove_dir_all(&destination)?;
         }
         fs::rename(&*directory, &destination)?;
         *directory = destination;
@@ -786,7 +842,7 @@ impl MasterState {
     }
 
     fn kill_shell(&self) {
-        if self.terminating.swap(true, Ordering::SeqCst) {
+        if self.shell_killed.swap(true, Ordering::SeqCst) {
             return;
         }
         unsafe {
@@ -824,7 +880,7 @@ impl MasterState {
     }
 
     fn finish(&self) -> ! {
-        if !self.terminating.swap(true, Ordering::SeqCst) {
+        if !self.exiting.swap(true, Ordering::SeqCst) {
             let writers = self
                 .clients
                 .lock()
@@ -933,7 +989,7 @@ fn sweep_abandoned_sessions(base: &Path) {
             continue;
         }
         // A live master answers on its socket, whatever the timestamps say.
-        if UnixStream::connect(path.join("control.sock")).is_ok() {
+        if !matches!(probe_socket(&path.join("control.sock")), Probe::Absent) {
             continue;
         }
         let modified = fs::metadata(path.join("scrollback"))
@@ -958,12 +1014,20 @@ pub(crate) fn list_command() -> io::Result<()> {
     directories.sort_by_key(|entry| entry.file_name());
 
     for directory in directories {
-        let path = directory.path().join("control.sock");
-        let Ok(mut stream) = UnixStream::connect(path) else {
+        // One unhealthy session must not hide the others, so every step here
+        // is skipped past rather than propagated.
+        let Probe::Listening(mut stream) = probe_socket(&directory.path().join("control.sock"))
+        else {
             continue;
         };
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        send_frame(&mut stream, FRAME_STATUS, &[])?;
+        if stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .and_then(|_| stream.set_write_timeout(Some(Duration::from_secs(2))))
+            .and_then(|_| send_frame(&mut stream, FRAME_STATUS, &[]))
+            .is_err()
+        {
+            continue;
+        }
         if let Ok((FRAME_STATUS_RESPONSE, payload)) = read_frame(&mut stream)
             && let Ok(status) = String::from_utf8(payload)
         {
@@ -995,11 +1059,7 @@ fn control_command(name: &str, kind: u8, payload: &[u8]) -> io::Result<()> {
     }
 }
 
-fn bridge_terminal(
-    mut stream: UnixStream,
-    replay_requested: bool,
-    scrollback: &Arc<Mutex<VecDeque<u8>>>,
-) -> io::Result<Attachment> {
+fn bridge_terminal(mut stream: UnixStream, replay_requested: bool) -> io::Result<Attachment> {
     let socket_fd = stream.as_raw_fd();
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
@@ -1062,7 +1122,6 @@ fn bridge_terminal(
             match frame {
                 (FRAME_OUTPUT, data) => {
                     painted = true;
-                    append_scrollback(scrollback, &data);
                     output.write_all(&data)?;
                     output.flush()?;
                 }
@@ -1205,7 +1264,7 @@ fn spawn_persistence_thread(state: Arc<MasterState>) {
                     libc::_exit(0);
                 }
             }
-            if state.terminating.load(Ordering::SeqCst) {
+            if state.exiting.load(Ordering::SeqCst) {
                 return;
             }
             thread::sleep(CWD_POLL_INTERVAL);
@@ -1221,115 +1280,103 @@ fn spawn_persistence_thread(state: Arc<MasterState>) {
     });
 }
 
-#[cfg(not(target_os = "macos"))]
-fn peer_pid(stream: &UnixStream) -> Option<libc::pid_t> {
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&raw mut cred).cast(),
-            &mut len,
-        )
-    };
-    (result == 0).then_some(cred.pid)
-}
-
-#[cfg(target_os = "macos")]
-fn peer_pid(stream: &UnixStream) -> Option<libc::pid_t> {
-    let mut pid: libc::pid_t = 0;
-    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERPID,
-            (&raw mut pid).cast(),
-            &mut len,
-        )
-    };
-    (result == 0).then_some(pid)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn child_pid_of(pid: libc::pid_t) -> Option<libc::pid_t> {
-    let content = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).ok()?;
-    content.split_whitespace().next()?.parse().ok()
-}
-
-#[cfg(target_os = "macos")]
-fn child_pid_of(pid: libc::pid_t) -> Option<libc::pid_t> {
-    let mut children = [0 as libc::pid_t; 8];
-    let bytes = unsafe {
-        proc_listchildpids(
-            pid,
-            children.as_mut_ptr().cast(),
-            (children.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int,
-        )
-    };
-    if bytes <= 0 {
-        return None;
-    }
-    let count = (bytes as usize / std::mem::size_of::<libc::pid_t>()).min(children.len());
-    children[..count].first().copied()
-}
-
-fn client_side_shell_pid(name: &str) -> Option<libc::pid_t> {
-    let path = socket_path(name).ok()?;
-    let stream = UnixStream::connect(path).ok()?;
-    child_pid_of(peer_pid(&stream)?)
-}
-
-fn spawn_client_persistence_thread(name: String, scrollback: Arc<Mutex<VecDeque<u8>>>) {
-    thread::spawn(move || {
-        let Ok(directory) = session_dir(&name) else {
-            return;
-        };
-        let mut shell_pid = None;
-        for _ in 0..5 {
-            shell_pid = client_side_shell_pid(&name);
-            if shell_pid.is_some() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(200));
-        }
-
-        let mut last_cwd: Option<PathBuf> = None;
-        let mut tick: u32 = 0;
-        loop {
-            thread::sleep(CWD_POLL_INTERVAL);
-            tick += 1;
-            if let Some(id) = current_boot_id() {
-                let _ = fs::write(directory.join("boot_id"), &id);
-            }
-            if let Some(pid) = shell_pid
-                && let Some(cwd) = shell_cwd(pid)
-                && last_cwd.as_deref() != Some(cwd.as_path())
-            {
-                let _ = fs::write(directory.join("cwd"), cwd.as_os_str().as_bytes());
-                last_cwd = Some(cwd);
-            }
-            if tick == 1 || tick.is_multiple_of(SCROLLBACK_FLUSH_EVERY_TICKS) {
-                let snapshot: Vec<u8> = scrollback
-                    .lock()
-                    .expect("scrollback mutex poisoned")
-                    .iter()
-                    .copied()
-                    .collect();
-                if !snapshot.is_empty() {
-                    let _ = fs::write(directory.join("scrollback"), snapshot);
-                }
-            }
-        }
-    });
-}
-
 fn close_fd(fd: RawFd) {
     if fd >= 0 {
         unsafe {
             libc::close(fd);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let path = env::temp_dir().join(format!(
+                "termphin-agent-unix-{label}-{}-{}",
+                process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&path).expect("temp dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_socket_nobody_is_listening_on_reads_as_absent() {
+        let dir = TempDir::new("absent");
+        assert!(matches!(
+            probe_socket(&dir.0.join("control.sock")),
+            Probe::Absent
+        ));
+
+        let path = dir.0.join("stale.sock");
+        drop(UnixListener::bind(&path).expect("bind"));
+        assert!(path.exists());
+        assert!(matches!(probe_socket(&path), Probe::Absent));
+    }
+
+    #[test]
+    fn a_live_master_is_never_mistaken_for_leftovers() {
+        let dir = TempDir::new("listening");
+        let path = dir.0.join("control.sock");
+        let _listener = UnixListener::bind(&path).expect("bind");
+
+        assert!(matches!(probe_socket(&path), Probe::Listening(_)));
+    }
+
+    #[test]
+    fn a_connection_that_could_not_be_made_is_not_evidence_of_absence() {
+        // Stands in for what a test cannot provoke - no descriptors left,
+        // permission denied - which land in the same branch.
+        let overlong = PathBuf::from("/tmp").join("x".repeat(200));
+
+        assert!(matches!(probe_socket(&overlong), Probe::Unknown(_)));
+    }
+
+    #[test]
+    fn readiness_gives_up_instead_of_waiting_forever() {
+        let pipe_fds = cloexec_pipe().expect("pipe");
+        let start = Instant::now();
+
+        assert!(!read_ready_within(pipe_fds[0], 150));
+        // Waited rather than returned straight away, and still gave up.
+        assert!(start.elapsed() >= Duration::from_millis(100));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        close_fd(pipe_fds[0]);
+        close_fd(pipe_fds[1]);
+    }
+
+    #[test]
+    fn readiness_reports_the_byte_the_master_wrote() {
+        let pipe_fds = cloexec_pipe().expect("pipe");
+        write_ready(pipe_fds[1], true);
+
+        assert!(read_ready_within(pipe_fds[0], 5_000));
+        close_fd(pipe_fds[0]);
+    }
+
+    #[test]
+    fn a_master_that_dies_without_answering_fails_at_once() {
+        let pipe_fds = cloexec_pipe().expect("pipe");
+        close_fd(pipe_fds[1]);
+        let start = Instant::now();
+
+        assert!(!read_ready_within(pipe_fds[0], 5_000));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        close_fd(pipe_fds[0]);
     }
 }
