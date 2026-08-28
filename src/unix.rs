@@ -1295,14 +1295,18 @@ mod tests {
     struct TempDir(PathBuf);
 
     impl TempDir {
+        /// Under `/tmp` rather than [`env::temp_dir`], and named as briefly as
+        /// it can be: a socket path has to fit `SUN_LEN`, which is 104 bytes
+        /// on macOS, and `TMPDIR` there is a long per-user path that leaves
+        /// almost nothing for the rest.
         fn new(label: &str) -> Self {
-            let path = env::temp_dir().join(format!(
-                "termphin-agent-unix-{label}-{}-{}",
+            let path = PathBuf::from("/tmp").join(format!(
+                "tphn-{label}-{}-{}",
                 process::id(),
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_nanos()
+                    .subsec_nanos()
             ));
             fs::create_dir_all(&path).expect("temp dir");
             Self(path)
