@@ -1,3 +1,5 @@
+[![Termphin - an SSH client whose sessions survive the dropped connection](https://termphin.dev/gh-banner.webp)](https://termphin.dev)
+
 # termphin-agent
 
 Keeps one remote shell alive while Termphin is disconnected, so a session
