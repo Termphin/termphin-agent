@@ -1,4 +1,8 @@
-[![Termphin - an SSH client whose sessions survive the dropped connection](https://termphin.dev/gh-banner.webp)](https://termphin.dev)
+[![Termphin - an SSH client whose sessions survive the dropped connection](https://termphin.dev/gh-banner.webp?v=3)](https://termphin.dev)
+
+The server-side half of [Termphin](https://termphin.dev), an SSH client whose
+sessions survive the dropped connection. This is the part that runs on your
+machine, built and released separately.
 
 # termphin-agent
 
