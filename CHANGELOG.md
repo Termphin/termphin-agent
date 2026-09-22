@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.0 - 2026-09-22
+
+- `attach --resume <epoch>:<offset>` continues a session from a position in its output instead of replaying it, when the master still holds everything since then (the last 1 MiB). A client that reconnects after a short drop gets only what it missed, so its own terminal and scrollback carry on unchanged. Otherwise it falls back to the replay, as does a master started by an older build.
+- The end of a replay or resume is followed by a position marker, `OSC 5383;termphin-offset;<epoch>:<offset>`, telling the client where live output starts. The epoch is new for every master, so a position from one that crashed or was restored after a reboot is never read against the next one's numbering.
+- Unix only. On Windows ConPTY re-renders the output, so the bytes a client receives are not the ones counted, and `--resume` is ignored.
+
 ## 0.11.0 - 2026-08-28
 
 - Fixed restores coming back with the wrong scrollback. A second writer on the client overwrote the master's snapshot with a stale raw-byte copy, and whichever wrote last won.
