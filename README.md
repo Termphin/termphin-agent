@@ -60,7 +60,7 @@ reason - there is no separate "unsupported" mode.
 ## Commands
 
 ```text
-termphin-agent attach [--replay] <name>
+termphin-agent attach [--replay] [--resume <epoch>:<offset>] <name>
 termphin-agent list
 termphin-agent rename <old-name> <new-name>
 termphin-agent kill <name>
@@ -78,6 +78,17 @@ frame limit. Modes that only affect input encoding are re-asserted after the
 replayed bytes. The alternate screen is re-entered ahead of them, and only when
 the sequence that switched to it has already been evicted, because entering it
 again would clear what the replay just drew.
+
+`--resume <epoch>:<offset>` continues from a position in the session's output
+instead, sending only what the client missed, as long as the master still
+holds it: the last 1 MiB of raw output. Every replay and resume ends with
+`ESC ] 5383;termphin-offset;<epoch>:<offset> BEL`, the position live output
+starts at, which the client counts on from to know where to resume next time.
+The epoch is new for every master, so a position from an earlier one of the
+same name is refused rather than misread. When the position is not there, the
+master replays instead; `--replay` alongside is what makes that fallback a
+full scrollback. Unix only - ConPTY re-renders output on Windows, so the
+counts would not match, and the flag is ignored there.
 
 On attach the master also briefly changes the PTY height while the alternate
 screen is active. That buffer has no scrollback to reconstruct, so the

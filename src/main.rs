@@ -35,6 +35,13 @@ pub(crate) const FRAME_STATUS: u8 = 4;
 pub(crate) const FRAME_RENAME: u8 = 5;
 pub(crate) const FRAME_KILL: u8 = 6;
 pub(crate) const FRAME_HISTORY: u8 = 7;
+/// Asks to continue from a byte offset of the session's output instead of a
+/// replay, for a client whose terminal already holds everything before it.
+/// Carries an [`OutputPosition`]. Sent before FRAME_ATTACH. Older masters answer with an error and go on to
+/// replay as asked, which is also what a newer one does when the offset has
+/// left [`OUTPUT_LOG_BYTES`].
+#[cfg(unix)]
+pub(crate) const FRAME_RESUME: u8 = 8;
 
 pub(crate) const FRAME_OUTPUT: u8 = 101;
 pub(crate) const FRAME_STATUS_RESPONSE: u8 = 102;
@@ -44,9 +51,142 @@ pub(crate) const FRAME_EXIT: u8 = 105;
 /// Sent after the last replay chunk, so the client can tell a complete
 /// scrollback from one still arriving. Older clients ignore unknown frames.
 pub(crate) const FRAME_REPLAY_DONE: u8 = 106;
+/// Sent after the output missed since a FRAME_RESUME position. Like
+/// FRAME_REPLAY_DONE, carries the [`OutputPosition`] live output continues
+/// from.
+#[cfg(unix)]
+pub(crate) const FRAME_RESUME_DONE: u8 = 107;
 
 pub(crate) const REPLAY_END_MARKER: &[u8] = b"\x1b]5380;termphin-replay-end\x07";
 pub(crate) const REBOOT_RESTORED_MARKER: &[u8] = b"\x1b]5381;termphin-reboot-restored\x07";
+/// Written instead of [`REPLAY_END_MARKER`] when the attach resumed rather
+/// than replayed: what came before it continues the client's own terminal.
+#[cfg(unix)]
+pub(crate) const RESUME_END_MARKER: &[u8] = b"\x1b]5380;termphin-resume-end\x07";
+
+/// Raw output kept for resuming. Past this a client that was away gets the
+/// replay instead.
+#[cfg(unix)]
+pub(crate) const OUTPUT_LOG_BYTES: usize = 1024 * 1024;
+
+/// Tells the client where the bytes after it start, so it can ask to resume
+/// from wherever it stops receiving.
+#[cfg(unix)]
+pub(crate) fn offset_marker(position: OutputPosition) -> Vec<u8> {
+    format!(
+        "\x1b]5383;termphin-offset;{}:{}\x07",
+        position.epoch, position.offset
+    )
+    .into_bytes()
+}
+
+/// A place in one master's output. The epoch keeps an offset from an earlier
+/// master of the same name - one that crashed, or was restored after a
+/// reboot - from being read against this one's numbering.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OutputPosition {
+    pub(crate) epoch: u64,
+    pub(crate) offset: u64,
+}
+
+#[cfg(unix)]
+impl OutputPosition {
+    pub(crate) fn encode(self) -> [u8; 16] {
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&self.epoch.to_be_bytes());
+        bytes[8..].copy_from_slice(&self.offset.to_be_bytes());
+        bytes
+    }
+
+    pub(crate) fn decode(payload: &[u8]) -> io::Result<Self> {
+        let (epoch, offset) = payload
+            .split_first_chunk::<8>()
+            .and_then(|(epoch, rest)| Some((epoch, <&[u8; 8]>::try_from(rest).ok()?)))
+            .ok_or_else(|| invalid_input("invalid output position"))?;
+        Ok(Self {
+            epoch: u64::from_be_bytes(*epoch),
+            offset: u64::from_be_bytes(*offset),
+        })
+    }
+
+    /// `<epoch>:<offset>`, as the marker writes it and `--resume` takes it.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let (epoch, offset) = value.split_once(':')?;
+        Some(Self {
+            epoch: epoch.parse().ok()?,
+            offset: offset.parse().ok()?,
+        })
+    }
+}
+
+/// The session's raw output, the last [`OUTPUT_LOG_BYTES`] of it, numbered
+/// from the start of the session.
+#[cfg(unix)]
+pub(crate) struct OutputLog {
+    epoch: u64,
+    bytes: VecDeque<u8>,
+    total: u64,
+    capacity: usize,
+}
+
+/// Different for every master: the clock, with the pid for two started in
+/// the same instant.
+#[cfg(unix)]
+fn new_epoch() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ (u64::from(process::id()) << 40)
+}
+
+#[cfg(unix)]
+impl OutputLog {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            epoch: new_epoch(),
+            bytes: VecDeque::new(),
+            total: 0,
+            capacity,
+        }
+    }
+
+    pub(crate) fn push(&mut self, data: &[u8]) {
+        self.total += data.len() as u64;
+        let data = &data[data.len().saturating_sub(self.capacity)..];
+        let overflow = (self.bytes.len() + data.len()).saturating_sub(self.capacity);
+        self.bytes.drain(..overflow);
+        self.bytes.extend(data);
+    }
+
+    /// Where the next byte will be written.
+    pub(crate) fn position(&self) -> OutputPosition {
+        OutputPosition {
+            epoch: self.epoch,
+            offset: self.total,
+        }
+    }
+
+    /// Everything from `position` on, or `None` once part of it is gone - or
+    /// for a position in some other master's output, or past this one's end.
+    pub(crate) fn since(&self, position: OutputPosition) -> Option<Vec<u8>> {
+        if position.epoch != self.epoch {
+            return None;
+        }
+        let offset = position.offset;
+        let oldest = self.total - self.bytes.len() as u64;
+        if offset < oldest || offset > self.total {
+            return None;
+        }
+        Some(
+            self.bytes
+                .range((offset - oldest) as usize..)
+                .copied()
+                .collect(),
+        )
+    }
+}
 
 pub(crate) const CWD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 pub(crate) const SCROLLBACK_FLUSH_EVERY_TICKS: u32 = 15;
@@ -89,13 +229,23 @@ fn run() -> io::Result<()> {
         "--version" => print_version(false),
         "version" => print_version(args.next().as_deref() == Some("--machine")),
         "attach" => {
-            let first = args.next();
-            let (replay, name) = if first.as_deref() == Some("--replay") {
-                (true, required_name(args.next())?)
-            } else {
-                (false, required_name(first)?)
+            let mut replay = false;
+            let mut resume = None;
+            let name = loop {
+                match args.next().as_deref() {
+                    Some("--replay") => replay = true,
+                    // Only read as a string here: positions are a Unix notion,
+                    // and Windows takes the flag without acting on it.
+                    Some("--resume") => {
+                        let value = args
+                            .next()
+                            .ok_or_else(|| invalid_input("missing resume position"))?;
+                        resume = Some(value);
+                    }
+                    other => break required_name(other.map(str::to_owned))?,
+                }
             };
-            platform::attach_command(&name, replay)?;
+            platform::attach_command(&name, replay, resume)?;
         }
         "list" => platform::list_command()?,
         "rename" => {
@@ -281,6 +431,8 @@ pub(crate) struct History {
     parser: vt100::Parser<TitleTracker>,
     title: Arc<Mutex<Option<Vec<u8>>>>,
     restored: bool,
+    #[cfg(unix)]
+    output: OutputLog,
 }
 
 impl History {
@@ -295,11 +447,20 @@ impl History {
             ),
             title: tracker.title,
             restored: false,
+            #[cfg(unix)]
+            output: OutputLog::new(OUTPUT_LOG_BYTES),
         }
     }
 
     pub(crate) fn push(&mut self, data: &[u8]) {
         self.parser.process(data);
+        #[cfg(unix)]
+        self.output.push(data);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn output(&self) -> &OutputLog {
+        &self.output
     }
 
     pub(crate) fn resize(&mut self, rows: u16, cols: u16) {
@@ -377,6 +538,108 @@ pub(crate) struct ClientQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn at(log: &OutputLog, offset: u64) -> OutputPosition {
+        OutputPosition {
+            epoch: log.position().epoch,
+            offset,
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn output_log_returns_what_was_missed() {
+        let mut log = OutputLog::new(16);
+        log.push(b"hello ");
+        let position = log.position();
+        log.push(b"world");
+
+        assert_eq!(log.since(position).as_deref(), Some(&b"world"[..]));
+        assert_eq!(log.since(log.position()).as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn output_log_refuses_an_offset_it_has_dropped() {
+        let mut log = OutputLog::new(8);
+        log.push(b"0123456789");
+
+        assert_eq!(log.position().offset, 10);
+        assert_eq!(log.since(at(&log, 1)), None);
+        assert_eq!(log.since(at(&log, 2)).as_deref(), Some(&b"23456789"[..]));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn output_log_refuses_an_offset_past_its_end() {
+        let mut log = OutputLog::new(8);
+        log.push(b"abc");
+
+        assert_eq!(log.since(at(&log, 4)), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn output_log_keeps_the_newest_bytes_across_pushes() {
+        let mut log = OutputLog::new(4);
+        log.push(b"ab");
+        log.push(b"cde");
+
+        assert_eq!(log.since(at(&log, 1)).as_deref(), Some(&b"bcde"[..]));
+        assert_eq!(log.since(at(&log, 0)), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn output_log_refuses_a_position_in_another_masters_output() {
+        // A master restored after a crash numbers its output from zero again;
+        // an offset the client kept from the old one must not land in it.
+        let mut old = OutputLog::new(64);
+        old.push(b"before the crash");
+        let kept = old.position();
+        let mut new = OutputLog::new(64);
+        new.push(b"a restored session, already further along");
+
+        assert_ne!(kept.epoch, new.position().epoch);
+        assert_eq!(new.since(kept), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn history_logs_what_it_is_given() {
+        let mut history = History::new(5, 20);
+        history.push(b"one");
+        let position = history.output().position();
+        history.push(b"two");
+
+        assert_eq!(history.output().position().offset, 6);
+        assert_eq!(
+            history.output().since(position).as_deref(),
+            Some(&b"two"[..])
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn output_positions_survive_every_encoding() {
+        let position = OutputPosition {
+            epoch: 7,
+            offset: 42,
+        };
+
+        assert_eq!(
+            offset_marker(position),
+            b"\x1b]5383;termphin-offset;7:42\x07"
+        );
+        assert_eq!(
+            OutputPosition::decode(&position.encode()).unwrap(),
+            position
+        );
+        assert_eq!(OutputPosition::parse("7:42"), Some(position));
+        assert!(OutputPosition::decode(b"short").is_err());
+        assert_eq!(OutputPosition::parse("42"), None);
+    }
 
     #[test]
     fn boot_id_differs_only_when_both_present_and_different() {

@@ -17,10 +17,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::{
     CLIENT_WRITE_TIMEOUT, CWD_POLL_INTERVAL, ClientQueue, FRAME_ATTACH, FRAME_ERROR, FRAME_EXIT,
     FRAME_HISTORY, FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_RENAME,
-    FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_STATUS, FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT,
-    History, MAX_CLIENTS, REPLAY_CHUNK_SIZE, REPLAY_END_MARKER, RestoreState,
-    SCROLLBACK_FLUSH_EVERY_TICKS, TermSize, decode_size, encode_size, invalid_input, read_frame,
-    send_frame, validate_name,
+    FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_RESUME, FRAME_RESUME_DONE, FRAME_STATUS,
+    FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT, History, MAX_CLIENTS, OutputPosition,
+    REPLAY_CHUNK_SIZE, REPLAY_END_MARKER, RESUME_END_MARKER, RestoreState,
+    SCROLLBACK_FLUSH_EVERY_TICKS, TermSize, decode_size, encode_size, invalid_input, offset_marker,
+    read_frame, send_frame, validate_name,
 };
 
 static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
@@ -145,35 +146,47 @@ impl Drop for CreationLock {
     }
 }
 
-pub(crate) fn attach_command(name: &str, replay: bool) -> io::Result<()> {
+pub(crate) fn attach_command(name: &str, replay: bool, resume: Option<String>) -> io::Result<()> {
+    let resume = resume
+        .map(|value| {
+            OutputPosition::parse(&value)
+                .ok_or_else(|| invalid_input("invalid resume position, expected <epoch>:<offset>"))
+        })
+        .transpose()?;
     install_attach_signal_handlers()?;
     let _raw_mode = RawModeGuard::enable(libc::STDIN_FILENO)?;
 
     if !replay {
-        try_attach(name, false)?;
+        try_attach(name, false, resume)?;
         return Ok(());
     }
-    if try_attach(name, true)? == Attachment::ReplayRejected {
+    if try_attach(name, true, resume)? == Attachment::ReplayRejected {
         // Masters started by an older build refuse a history larger than one
         // frame. Reaching a session without its scrollback beats refusing to
         // reach it at all, so drop the replay and attach again.
-        try_attach(name, false)?;
+        try_attach(name, false, None)?;
     }
     Ok(())
 }
 
-fn try_attach(name: &str, replay: bool) -> io::Result<Attachment> {
+fn try_attach(name: &str, replay: bool, resume: Option<OutputPosition>) -> io::Result<Attachment> {
     let size = terminal_size(libc::STDIN_FILENO);
     let mut stream = connect_or_create(name, size)?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    // Masters that predate an optional frame return an error for it, then
+    // still accept FRAME_ATTACH. The client ignores one such compatibility
+    // error per optional frame below.
+    let mut optional_frames = 0;
     if replay {
-        // Protocol-v1 masters older than 0.2 return an error for this optional
-        // frame, then still accept FRAME_ATTACH. The client ignores that one
-        // compatibility error below.
         send_frame(&mut stream, FRAME_HISTORY, &[])?;
+        optional_frames += 1;
+    }
+    if let Some(position) = resume {
+        send_frame(&mut stream, FRAME_RESUME, &position.encode())?;
+        optional_frames += 1;
     }
     send_frame(&mut stream, FRAME_ATTACH, &encode_size(from_winsize(size)))?;
-    bridge_terminal(stream, replay)
+    bridge_terminal(stream, replay, optional_frames)
 }
 
 #[derive(PartialEq, Eq)]
@@ -722,16 +735,30 @@ struct MasterState {
 }
 
 impl MasterState {
-    fn add_client(&self, id: u64, channel: Arc<ClientChannel>, replay: bool) -> io::Result<()> {
+    fn add_client(
+        &self,
+        id: u64,
+        channel: Arc<ClientChannel>,
+        replay: bool,
+        resume: Option<OutputPosition>,
+    ) -> io::Result<()> {
         // Held across both steps so output arriving mid-replay queues behind the
         // snapshot. Queueing never blocks, so a slow client cannot hold the PTY
         // reader hostage.
         let mut history = self.history.lock().expect("history mutex poisoned");
-        if replay {
+        let missed = resume.and_then(|position| history.output().since(position));
+        if let Some(missed) = missed {
+            for chunk in missed.chunks(REPLAY_CHUNK_SIZE) {
+                channel.send(FRAME_OUTPUT, chunk)?;
+            }
+            let position = history.output().position();
+            channel.send(FRAME_RESUME_DONE, &position.encode())?;
+        } else if replay {
             for chunk in history.snapshot().chunks(REPLAY_CHUNK_SIZE) {
                 channel.send(FRAME_OUTPUT, chunk)?;
             }
-            channel.send(FRAME_REPLAY_DONE, &[])?;
+            let position = history.output().position();
+            channel.send(FRAME_REPLAY_DONE, &position.encode())?;
         }
         self.clients
             .lock()
@@ -920,6 +947,7 @@ fn client_loop(id: u64, mut stream: UnixStream, state: Arc<MasterState>) {
     let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
     let mut attached = false;
     let mut replay_requested = false;
+    let mut resume_from = None;
 
     while let Ok((kind, payload)) = read_frame(&mut stream) {
         let outcome = match kind {
@@ -927,12 +955,15 @@ fn client_loop(id: u64, mut stream: UnixStream, state: Arc<MasterState>) {
                 replay_requested = true;
                 Ok(())
             }
+            FRAME_RESUME if !attached => OutputPosition::decode(&payload).map(|position| {
+                resume_from = Some(position);
+            }),
             FRAME_ATTACH => {
                 let attach_result = if !attached {
                     attached = true;
                     // An attached client may idle for hours between keystrokes.
                     let _ = stream.set_read_timeout(None);
-                    state.add_client(id, Arc::clone(&writer), replay_requested)
+                    state.add_client(id, Arc::clone(&writer), replay_requested, resume_from)
                 } else {
                     Ok(())
                 };
@@ -1059,12 +1090,25 @@ fn control_command(name: &str, kind: u8, payload: &[u8]) -> io::Result<()> {
     }
 }
 
-fn bridge_terminal(mut stream: UnixStream, replay_requested: bool) -> io::Result<Attachment> {
+/// The output position a master sent with its end-of-replay frame, as a
+/// marker the app reads. Masters that predate positions send none.
+fn write_offset(output: &mut impl Write, payload: &[u8]) -> io::Result<()> {
+    match OutputPosition::decode(payload) {
+        Ok(position) => output.write_all(&offset_marker(position)),
+        Err(_) => Ok(()),
+    }
+}
+
+fn bridge_terminal(
+    mut stream: UnixStream,
+    replay_requested: bool,
+    optional_frames: usize,
+) -> io::Result<Attachment> {
     let socket_fd = stream.as_raw_fd();
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     let mut buffer = [0_u8; 8192];
-    let mut tolerate_legacy_replay_error = replay_requested;
+    let mut tolerated_legacy_errors = optional_frames;
     let mut painted = false;
 
     loop {
@@ -1125,20 +1169,27 @@ fn bridge_terminal(mut stream: UnixStream, replay_requested: bool) -> io::Result
                     output.write_all(&data)?;
                     output.flush()?;
                 }
-                (FRAME_REPLAY_DONE, _) => {
+                (FRAME_REPLAY_DONE, total) => {
                     // Writing the marker counts as painting: a retry without
                     // the replay would emit it a second time, and the app
                     // would take the first one for the whole history.
                     painted = true;
                     output.write_all(REPLAY_END_MARKER)?;
+                    write_offset(&mut output, &total)?;
+                    output.flush()?;
+                }
+                (FRAME_RESUME_DONE, total) => {
+                    painted = true;
+                    output.write_all(RESUME_END_MARKER)?;
+                    write_offset(&mut output, &total)?;
                     output.flush()?;
                 }
                 (FRAME_EXIT, _) => return Ok(Attachment::Finished),
                 (FRAME_ERROR, message) => {
-                    if tolerate_legacy_replay_error
+                    if tolerated_legacy_errors > 0
                         && message.as_slice() == b"invalid protocol frame"
                     {
-                        tolerate_legacy_replay_error = false;
+                        tolerated_legacy_errors -= 1;
                         continue;
                     }
                     if replay_requested && !painted {

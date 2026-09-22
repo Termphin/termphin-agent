@@ -1409,7 +1409,10 @@ fn control_command(name: &str, kind: u8, payload: &[u8]) -> io::Result<()> {
     }
 }
 
-pub(crate) fn attach_command(name: &str, replay: bool) -> io::Result<()> {
+/// `_resume` is not honoured here: ConPTY re-renders the output, so the
+/// bytes a client receives are not the bytes an offset counts. A resume asked
+/// for gets the replay, which is what the app falls back to anyway.
+pub(crate) fn attach_command(name: &str, replay: bool, _resume: Option<String>) -> io::Result<()> {
     let _raw_mode = ConsoleRawMode::enable()?;
 
     if !replay {
