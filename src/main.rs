@@ -130,15 +130,21 @@ pub(crate) struct OutputLog {
     capacity: usize,
 }
 
-/// Different for every master: the clock, with the pid for two started in
-/// the same instant.
+/// Different for every master. Random, not the clock and pid: a pid comes
+/// round again after a reboot, and macOS reads the clock in microseconds.
 #[cfg(unix)]
 fn new_epoch() -> u64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos() as u64)
-        .unwrap_or(0);
-    nanos ^ (u64::from(process::id()) << 40)
+    let mut bytes = [0_u8; 8];
+    let random =
+        std::fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut bytes));
+    if random.is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(0);
+        return nanos ^ (u64::from(process::id()) << 40);
+    }
+    u64::from_ne_bytes(bytes)
 }
 
 #[cfg(unix)]
