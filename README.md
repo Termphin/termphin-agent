@@ -57,15 +57,62 @@ If that job doesn't permit breakaway, the session just doesn't outlive the
 connection, the same as a session that didn't shut down cleanly for any other
 reason - there is no separate "unsupported" mode.
 
+## Using it from a terminal
+
+The app installs the agent on its own. To reach the same sessions from a
+terminal on the server - pick up on a laptop what you started on the phone -
+put it on your PATH as `termphin`:
+
+```sh
+curl -fsSL https://github.com/Termphin/termphin-agent/releases/latest/download/install.sh | sh
+```
+
+```powershell
+irm https://github.com/Termphin/termphin-agent/releases/latest/download/install.ps1 | iex
+```
+
+Where the app has already installed the agent, the script only links it:
+`~/.local/bin/termphin` on Linux and macOS (adding that directory to your shell
+profile if it is not on PATH), a `termphin.cmd` beside the binary on Windows,
+whose directory goes on your user PATH. Otherwise it downloads the release
+binary into the same place the app uses, checks it against the release's
+checksum and writes the metadata the app reads, so the two never fight over
+which copy is current.
+
+```text
+termphin attach [name]    attach, choosing one if there are several
+termphin new [name]       start a session and attach to it
+termphin ls               list sessions
+```
+
+Detach with `Ctrl-\` then `d`; `Ctrl-\` twice sends one on. Detaching resets
+whatever modes a program left your terminal in - the alternate screen, mouse
+reporting, a hidden cursor.
+
+Several clients can be attached at once. The session takes the size of
+whichever one last attached or typed, and goes back to the previous one's when
+that one leaves - a phone and a laptop cannot both have their own width, so
+the one in use gets it.
+
+`attach` from inside a session is refused: every session's shell has
+`TERMPHIN_SESSION` set to its name. Unset it to nest on purpose.
+
 ## Commands
 
 ```text
 termphin-agent attach [--replay] [--resume <epoch>:<offset>] <name>
+termphin-agent attach [name]
+termphin-agent new [name]
+termphin-agent ls
 termphin-agent list
 termphin-agent rename <old-name> <new-name>
 termphin-agent kill <name>
 termphin-agent version --machine
 ```
+
+`attach` with `--replay` or `--resume` is the app's: no detach key, no choice,
+the name required. `list` prints one tab-separated line per session for the
+app to parse, `ls` the same for people.
 
 Each session has a master process and a Unix socket below
 `~/.cache/termphin/sessions`. The attach client forwards terminal resize events

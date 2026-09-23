@@ -52,11 +52,12 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::win32_codec::{CWD_PROMPT_HOOK, Win32InputDecoder, base64_utf16le};
 use crate::{
-    CLIENT_WRITE_TIMEOUT, ClientQueue, FRAME_ATTACH, FRAME_ERROR, FRAME_EXIT, FRAME_HISTORY,
-    FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_RENAME, FRAME_REPLAY_DONE, FRAME_RESIZE,
-    FRAME_STATUS, FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT, History, MAX_CLIENTS,
-    REPLAY_CHUNK_SIZE, REPLAY_END_MARKER, RestoreState, SCROLLBACK_FLUSH_EVERY_TICKS, TermSize,
-    decode_size, encode_size, invalid_input, read_frame, send_frame, validate_name,
+    CLIENT_WRITE_TIMEOUT, ClientQueue, DetachKey, Ending, FRAME_ATTACH, FRAME_ERROR, FRAME_EXIT,
+    FRAME_HISTORY, FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_RENAME,
+    FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_STATUS, FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT,
+    History, MAX_CLIENTS, REPLAY_CHUNK_SIZE, REPLAY_END_MARKER, RestoreState,
+    SCROLLBACK_FLUSH_EVERY_TICKS, SESSION_ENV, TermSize, Viewers, decode_size, encode_size,
+    invalid_input, read_frame, send_frame, validate_name,
 };
 
 /// Ten cheap console reads a second, against a visible lag on every rotation
@@ -815,6 +816,7 @@ struct MasterState {
     pty_write: Mutex<SyncPipe>,
     clients: Mutex<HashMap<u64, Arc<ClientChannel>>>,
     history: Mutex<History>,
+    viewers: Mutex<Viewers>,
     size: Mutex<TermSize>,
     pending_listener: Mutex<Option<RawHandle>>,
     terminating: AtomicBool,
@@ -842,6 +844,47 @@ impl MasterState {
             .lock()
             .expect("clients mutex poisoned")
             .remove(&id);
+        let back_to = self
+            .viewers
+            .lock()
+            .expect("viewers mutex poisoned")
+            .left(id);
+        if let Some(size) = back_to {
+            let _ = self.resize(size);
+        }
+    }
+
+    fn attached_at(&self, id: u64, size: TermSize) -> io::Result<()> {
+        let size = self
+            .viewers
+            .lock()
+            .expect("viewers mutex poisoned")
+            .attached(id, size);
+        self.resize(size).map(|_| ())
+    }
+
+    fn resized_to(&self, id: u64, size: TermSize) -> io::Result<()> {
+        let apply = self
+            .viewers
+            .lock()
+            .expect("viewers mutex poisoned")
+            .resized(id, size);
+        match apply {
+            Some(size) => self.resize(size).map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
+    fn input_from(&self, id: u64, data: &[u8]) -> io::Result<()> {
+        let apply = self
+            .viewers
+            .lock()
+            .expect("viewers mutex poisoned")
+            .typed(id);
+        if let Some(size) = apply {
+            self.resize(size)?;
+        }
+        self.write_input(data)
     }
 
     fn broadcast_output(&self, data: &[u8]) {
@@ -1037,13 +1080,12 @@ fn client_loop(id: u64, pipe: AsyncPipe, state: Arc<MasterState>) {
                 };
                 attach_result
                     .and_then(|_| decode_size(&payload))
-                    .and_then(|size| state.resize(size))
-                    .map(|_| ())
+                    .and_then(|size| state.attached_at(id, size))
             }
-            FRAME_INPUT if attached => state.write_input(&payload),
-            FRAME_RESIZE if attached => decode_size(&payload)
-                .and_then(|size| state.resize(size))
-                .map(|_| ()),
+            FRAME_INPUT if attached => state.input_from(id, &payload),
+            FRAME_RESIZE if attached => {
+                decode_size(&payload).and_then(|size| state.resized_to(id, size))
+            }
             FRAME_STATUS => writer.send(FRAME_STATUS_RESPONSE, state.status().as_bytes()),
             FRAME_RENAME => match String::from_utf8(payload) {
                 Ok(name) => state
@@ -1116,6 +1158,8 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
     std::fs::create_dir_all(&directory)?;
     install_master_panic_log(directory.clone());
     let directory_log = directory.clone();
+    // Before the shell starts, which is what inherits it; nothing else runs yet.
+    unsafe { env::set_var(SESSION_ENV, &name) };
 
     let (pseudo_console, pty_write, pty_read, child) =
         spawn_conpty_shell(size).map_err(|error| log_master_error(&directory_log, error))?;
@@ -1143,6 +1187,7 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
         pty_write: Mutex::new(pty_write),
         clients: Mutex::new(HashMap::new()),
         history: Mutex::new(history),
+        viewers: Mutex::new(Viewers::default()),
         size: Mutex::new(size),
         pending_listener: Mutex::new(None),
         pty_closed: AtomicBool::new(false),
@@ -1364,6 +1409,13 @@ fn sweep_abandoned_sessions(base: &std::path::Path) {
 }
 
 pub(crate) fn list_command() -> io::Result<()> {
+    for status in session_statuses()? {
+        println!("{status}");
+    }
+    Ok(())
+}
+
+pub(crate) fn session_statuses() -> io::Result<Vec<String>> {
     let base = prepare_base_dir()?;
     sweep_abandoned_sessions(&base);
     let mut directories = std::fs::read_dir(base)?
@@ -1372,6 +1424,7 @@ pub(crate) fn list_command() -> io::Result<()> {
         .collect::<Vec<_>>();
     directories.sort_by_key(|entry| entry.file_name());
 
+    let mut statuses = Vec::new();
     for directory in directories {
         let name = directory.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -1382,10 +1435,10 @@ pub(crate) fn list_command() -> io::Result<()> {
         if let Ok((FRAME_STATUS_RESPONSE, payload)) = read_frame(&mut pipe)
             && let Ok(status) = String::from_utf8(payload)
         {
-            println!("{status}");
+            statuses.push(status);
         }
     }
-    Ok(())
+    Ok(statuses)
 }
 
 pub(crate) fn rename_command(old_name: &str, new_name: &str) -> io::Result<()> {
@@ -1416,18 +1469,41 @@ pub(crate) fn attach_command(name: &str, replay: bool, _resume: Option<String>) 
     let _raw_mode = ConsoleRawMode::enable()?;
 
     if !replay {
-        try_attach(name, false)?;
+        try_attach(name, false, false)?;
         return Ok(());
     }
-    if try_attach(name, true)? == Attachment::ReplayRejected {
-        try_attach(name, false)?;
+    if try_attach(name, true, false)? == Attachment::ReplayRejected {
+        try_attach(name, false, false)?;
     }
     Ok(())
+}
+
+/// Modes a program in the session may have left the person's own terminal
+/// in: the alternate screen, a hidden cursor, mouse reporting, bracketed
+/// paste, the application keypad, colours.
+const RESET_ON_DETACH: &[u8] =
+    b"\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b>\x1b[0m\r\n";
+
+pub(crate) fn attach_person(name: &str) -> io::Result<Ending> {
+    let _raw_mode = ConsoleRawMode::enable()?;
+    let attachment = match try_attach(name, true, true)? {
+        Attachment::ReplayRejected => try_attach(name, false, true)?,
+        other => other,
+    };
+    // Still in VT mode: restored, the console would print these as text.
+    let mut output = io::stdout().lock();
+    output.write_all(RESET_ON_DETACH)?;
+    output.flush()?;
+    Ok(match attachment {
+        Attachment::Detached => Ending::Detached,
+        _ => Ending::Ended,
+    })
 }
 
 #[derive(PartialEq, Eq)]
 enum Attachment {
     Finished,
+    Detached,
     ReplayRejected,
 }
 
@@ -1442,14 +1518,14 @@ fn console_size() -> TermSize {
     TermSize { cols: 80, rows: 24 }
 }
 
-fn try_attach(name: &str, replay: bool) -> io::Result<Attachment> {
+fn try_attach(name: &str, replay: bool, detach_key: bool) -> io::Result<Attachment> {
     let size = console_size();
     let pipe = connect_or_create(name, size)?;
     if replay {
         send_frame(&mut &pipe, FRAME_HISTORY, &[])?;
     }
     send_frame(&mut &pipe, FRAME_ATTACH, &encode_size(size))?;
-    bridge_terminal(pipe, size, replay)
+    bridge_terminal(pipe, size, replay, detach_key)
 }
 
 impl Read for &AsyncPipe {
@@ -1473,9 +1549,13 @@ fn bridge_terminal(
     pipe: AsyncPipe,
     initial_size: TermSize,
     replay_requested: bool,
+    detach_key: bool,
 ) -> io::Result<Attachment> {
     let pipe = Arc::new(pipe);
     let input_pipe = Arc::clone(&pipe);
+    let detached = Arc::new(AtomicBool::new(false));
+    let input_detached = Arc::clone(&detached);
+    let mut detach_key = detach_key.then(DetachKey::default);
 
     // Own thread because Windows has no single call that waits on both a
     // console input handle and a named pipe the way `poll()` does on Unix.
@@ -1500,10 +1580,19 @@ fn bridge_terminal(
                 return;
             }
             let decoded = win32_input.feed(&buffer[..read as usize]);
-            if decoded.is_empty() {
-                continue;
+            let (forward, detach) = match detach_key.as_mut() {
+                Some(key) => key.feed(&decoded),
+                None => (decoded, false),
+            };
+            if !forward.is_empty() && send_frame(&mut &*input_pipe, FRAME_INPUT, &forward).is_err()
+            {
+                return;
             }
-            if send_frame(&mut &*input_pipe, FRAME_INPUT, &decoded).is_err() {
+            if detach {
+                // The output loop below is blocked reading the pipe; a status
+                // request is what makes the master write to it.
+                input_detached.store(true, Ordering::SeqCst);
+                let _ = send_frame(&mut &*input_pipe, FRAME_STATUS, &[]);
                 return;
             }
         }
@@ -1548,6 +1637,9 @@ fn bridge_terminal(
                 output.flush()?;
             }
             (FRAME_EXIT, _) => return Ok(Attachment::Finished),
+            (FRAME_STATUS_RESPONSE, _) if detached.load(Ordering::SeqCst) => {
+                return Ok(Attachment::Detached);
+            }
             (FRAME_ERROR, message) => {
                 if tolerate_legacy_replay_error && message.as_slice() == b"invalid protocol frame" {
                     tolerate_legacy_replay_error = false;

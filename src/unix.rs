@@ -15,13 +15,13 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
-    CLIENT_WRITE_TIMEOUT, CWD_POLL_INTERVAL, ClientQueue, FRAME_ATTACH, FRAME_ERROR, FRAME_EXIT,
-    FRAME_HISTORY, FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_RENAME,
-    FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_RESUME, FRAME_RESUME_DONE, FRAME_STATUS,
+    CLIENT_WRITE_TIMEOUT, CWD_POLL_INTERVAL, ClientQueue, DetachKey, Ending, FRAME_ATTACH,
+    FRAME_ERROR, FRAME_EXIT, FRAME_HISTORY, FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT,
+    FRAME_RENAME, FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_RESUME, FRAME_RESUME_DONE, FRAME_STATUS,
     FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT, History, MAX_CLIENTS, OutputPosition,
     REPLAY_CHUNK_SIZE, REPLAY_END_MARKER, RESUME_END_MARKER, RestoreState,
-    SCROLLBACK_FLUSH_EVERY_TICKS, TermSize, decode_size, encode_size, invalid_input, offset_marker,
-    read_frame, send_frame, validate_name,
+    SCROLLBACK_FLUSH_EVERY_TICKS, SESSION_ENV, TermSize, Viewers, decode_size, encode_size,
+    invalid_input, offset_marker, read_frame, send_frame, validate_name,
 };
 
 static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
@@ -157,19 +157,48 @@ pub(crate) fn attach_command(name: &str, replay: bool, resume: Option<String>) -
     let _raw_mode = RawModeGuard::enable(libc::STDIN_FILENO)?;
 
     if !replay {
-        try_attach(name, false, resume)?;
+        try_attach(name, false, resume, false)?;
         return Ok(());
     }
-    if try_attach(name, true, resume)? == Attachment::ReplayRejected {
+    if try_attach(name, true, resume, false)? == Attachment::ReplayRejected {
         // Masters started by an older build refuse a history larger than one
         // frame. Reaching a session without its scrollback beats refusing to
         // reach it at all, so drop the replay and attach again.
-        try_attach(name, false, None)?;
+        try_attach(name, false, None, false)?;
     }
     Ok(())
 }
 
-fn try_attach(name: &str, replay: bool, resume: Option<OutputPosition>) -> io::Result<Attachment> {
+/// Modes a program in the session may have left the person's own terminal
+/// in: the alternate screen, a hidden cursor, mouse reporting, bracketed
+/// paste, the application keypad, colours.
+const RESET_ON_DETACH: &[u8] =
+    b"\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b>\x1b[0m\r\n";
+
+pub(crate) fn attach_person(name: &str) -> io::Result<Ending> {
+    install_attach_signal_handlers()?;
+    let attachment = {
+        let _raw_mode = RawModeGuard::enable(libc::STDIN_FILENO)?;
+        match try_attach(name, true, None, true)? {
+            Attachment::ReplayRejected => try_attach(name, false, None, true)?,
+            other => other,
+        }
+    };
+    let mut output = io::stdout().lock();
+    output.write_all(RESET_ON_DETACH)?;
+    output.flush()?;
+    Ok(match attachment {
+        Attachment::Detached => Ending::Detached,
+        _ => Ending::Ended,
+    })
+}
+
+fn try_attach(
+    name: &str,
+    replay: bool,
+    resume: Option<OutputPosition>,
+    detach_key: bool,
+) -> io::Result<Attachment> {
     let size = terminal_size(libc::STDIN_FILENO);
     let mut stream = connect_or_create(name, size)?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -186,13 +215,20 @@ fn try_attach(name: &str, replay: bool, resume: Option<OutputPosition>) -> io::R
         optional_frames += 1;
     }
     send_frame(&mut stream, FRAME_ATTACH, &encode_size(from_winsize(size)))?;
-    bridge_terminal(stream, replay, optional_frames)
+    bridge_terminal(
+        stream,
+        replay,
+        optional_frames,
+        detach_key.then(DetachKey::default),
+    )
 }
 
 #[derive(PartialEq, Eq)]
 enum Attachment {
-    /// The session ended, or the user detached.
+    /// The session ended, or input closed.
     Finished,
+    /// The person pressed the detach key.
+    Detached,
     /// The master refused the attach while replaying, before any output
     /// reached the terminal, so retrying without a replay is still safe.
     ReplayRejected,
@@ -390,6 +426,8 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
         }
         install_master_sigterm_handler()?;
         redirect_stdio()?;
+        // Still single-threaded: nothing else can be reading the environment.
+        unsafe { env::set_var(SESSION_ENV, &name) };
 
         let directory = session_dir(&name)?;
         let path = directory.join("control.sock");
@@ -440,6 +478,7 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
             pty: Mutex::new(writer),
             clients: Mutex::new(HashMap::new()),
             history: Mutex::new(history),
+            viewers: Mutex::new(Viewers::default()),
             shell_killed: AtomicBool::new(false),
             exiting: AtomicBool::new(false),
         });
@@ -727,6 +766,7 @@ struct MasterState {
     pty: Mutex<File>,
     clients: Mutex<HashMap<u64, Arc<ClientChannel>>>,
     history: Mutex<History>,
+    viewers: Mutex<Viewers>,
     /// Separate from [`Self::exiting`] on purpose: sharing one flag meant an
     /// explicit `kill` marked the session wound down, and [`Self::finish`]
     /// then skipped both the exit frame and the drain of the last output.
@@ -772,6 +812,47 @@ impl MasterState {
             .lock()
             .expect("clients mutex poisoned")
             .remove(&id);
+        let back_to = self
+            .viewers
+            .lock()
+            .expect("viewers mutex poisoned")
+            .left(id);
+        if let Some(size) = back_to {
+            let _ = self.resize(to_winsize(size));
+        }
+    }
+
+    fn attached_at(&self, id: u64, size: TermSize) -> io::Result<()> {
+        let size = self
+            .viewers
+            .lock()
+            .expect("viewers mutex poisoned")
+            .attached(id, size);
+        self.resize(to_winsize(size)).map(|_| ())
+    }
+
+    fn resized_to(&self, id: u64, size: TermSize) -> io::Result<()> {
+        let apply = self
+            .viewers
+            .lock()
+            .expect("viewers mutex poisoned")
+            .resized(id, size);
+        match apply {
+            Some(size) => self.resize(to_winsize(size)).map(|_| ()),
+            None => Ok(()),
+        }
+    }
+
+    fn input_from(&self, id: u64, data: &[u8]) -> io::Result<()> {
+        let apply = self
+            .viewers
+            .lock()
+            .expect("viewers mutex poisoned")
+            .typed(id);
+        if let Some(size) = apply {
+            self.resize(to_winsize(size))?;
+        }
+        self.write_input(data)
     }
 
     fn broadcast_output(&self, data: &[u8]) {
@@ -969,13 +1050,12 @@ fn client_loop(id: u64, mut stream: UnixStream, state: Arc<MasterState>) {
                 };
                 attach_result
                     .and_then(|_| decode_size(&payload))
-                    .and_then(|size| state.resize(to_winsize(size)))
-                    .map(|_| ())
+                    .and_then(|size| state.attached_at(id, size))
             }
-            FRAME_INPUT if attached => state.write_input(&payload),
-            FRAME_RESIZE if attached => decode_size(&payload)
-                .and_then(|size| state.resize(to_winsize(size)))
-                .map(|_| ()),
+            FRAME_INPUT if attached => state.input_from(id, &payload),
+            FRAME_RESIZE if attached => {
+                decode_size(&payload).and_then(|size| state.resized_to(id, size))
+            }
             FRAME_STATUS => writer.send(FRAME_STATUS_RESPONSE, state.status().as_bytes()),
             FRAME_RENAME => match String::from_utf8(payload) {
                 Ok(name) => state
@@ -1036,6 +1116,13 @@ fn sweep_abandoned_sessions(base: &Path) {
 }
 
 pub(crate) fn list_command() -> io::Result<()> {
+    for status in session_statuses()? {
+        println!("{status}");
+    }
+    Ok(())
+}
+
+pub(crate) fn session_statuses() -> io::Result<Vec<String>> {
     let base = prepare_base_dir()?;
     sweep_abandoned_sessions(&base);
     let mut directories = fs::read_dir(base)?
@@ -1044,6 +1131,7 @@ pub(crate) fn list_command() -> io::Result<()> {
         .collect::<Vec<_>>();
     directories.sort_by_key(|entry| entry.file_name());
 
+    let mut statuses = Vec::new();
     for directory in directories {
         // One unhealthy session must not hide the others, so every step here
         // is skipped past rather than propagated.
@@ -1062,10 +1150,10 @@ pub(crate) fn list_command() -> io::Result<()> {
         if let Ok((FRAME_STATUS_RESPONSE, payload)) = read_frame(&mut stream)
             && let Ok(status) = String::from_utf8(payload)
         {
-            println!("{status}");
+            statuses.push(status);
         }
     }
-    Ok(())
+    Ok(statuses)
 }
 
 pub(crate) fn rename_command(old_name: &str, new_name: &str) -> io::Result<()> {
@@ -1103,6 +1191,7 @@ fn bridge_terminal(
     mut stream: UnixStream,
     replay_requested: bool,
     optional_frames: usize,
+    mut detach_key: Option<DetachKey>,
 ) -> io::Result<Attachment> {
     let socket_fd = stream.as_raw_fd();
     let mut input = io::stdin().lock();
@@ -1146,7 +1235,18 @@ fn bridge_terminal(
             if count == 0 {
                 return Ok(Attachment::Finished);
             }
-            send_frame(&mut stream, FRAME_INPUT, &buffer[..count])?;
+            match detach_key.as_mut() {
+                None => send_frame(&mut stream, FRAME_INPUT, &buffer[..count])?,
+                Some(key) => {
+                    let (forward, detached) = key.feed(&buffer[..count]);
+                    if !forward.is_empty() {
+                        send_frame(&mut stream, FRAME_INPUT, &forward)?;
+                    }
+                    if detached {
+                        return Ok(Attachment::Detached);
+                    }
+                }
+            }
         }
         if poll_fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
             return Ok(Attachment::Finished);

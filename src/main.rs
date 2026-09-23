@@ -228,13 +228,26 @@ fn main() {
     }
 }
 
+const USAGE: &str = "\
+usage: termphin <command>
+
+  attach [name]         attach to a session, choosing one if there are several
+  new [name]            start a session and attach to it
+  ls                    list sessions
+  rename <old> <new>    rename a session
+  kill <name>           end a session
+  version               print the version
+
+Detach with Ctrl-\\ then d. Ctrl-\\ twice sends it to the program.
+";
+
 fn run() -> io::Result<()> {
     let mut args = env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "help".to_owned());
     match command.as_str() {
         "--version" => print_version(false),
         "version" => print_version(args.next().as_deref() == Some("--machine")),
-        "attach" => {
+        "attach" | "a" => {
             let mut replay = false;
             let mut resume = None;
             let name = loop {
@@ -248,11 +261,19 @@ fn run() -> io::Result<()> {
                             .ok_or_else(|| invalid_input("missing resume position"))?;
                         resume = Some(value);
                     }
-                    other => break required_name(other.map(str::to_owned))?,
+                    other => break other.map(str::to_owned),
                 }
             };
-            platform::attach_command(&name, replay, resume)?;
+            // The app always passes a flag; a bare attach is a person at a
+            // terminal, who gets the replay, a detach key and a choice.
+            if replay || resume.is_some() {
+                platform::attach_command(&required_name(name)?, replay, resume)?;
+            } else {
+                attach_person(name)?;
+            }
         }
+        "new" => new_session(args.next())?,
+        "ls" => print_sessions()?,
         "list" => platform::list_command()?,
         "rename" => {
             let old_name = required_name(args.next())?;
@@ -264,12 +285,277 @@ fn run() -> io::Result<()> {
         // process that spawned it. Not part of the public CLI.
         #[cfg(windows)]
         "__master" => windows::run_as_master(args)?,
+        "help" | "--help" | "-h" => print!("{USAGE}"),
         _ => {
-            eprintln!("usage: termphin-agent <attach|list|rename|kill|version>");
+            eprint!("{USAGE}");
             process::exit(2);
         }
     }
     Ok(())
+}
+
+/// Set in every session's shell, so an attach from inside one can tell.
+pub(crate) const SESSION_ENV: &str = "TERMPHIN_SESSION";
+
+fn refuse_nesting() -> io::Result<()> {
+    match env::var(SESSION_ENV) {
+        Ok(name) => Err(io::Error::other(format!(
+            "already inside session {name} - detach first, or unset {SESSION_ENV} to nest"
+        ))),
+        Err(_) => Ok(()),
+    }
+}
+
+fn attach_person(name: Option<String>) -> io::Result<()> {
+    refuse_nesting()?;
+    let name = match name {
+        Some(name) => {
+            validate_name(&name)?;
+            name
+        }
+        None => choose_session(&sessions()?)?,
+    };
+    finish_attach(&name, platform::attach_person(&name)?);
+    Ok(())
+}
+
+fn new_session(name: Option<String>) -> io::Result<()> {
+    refuse_nesting()?;
+    let existing = sessions()?;
+    let name = match name {
+        Some(name) => {
+            validate_name(&name)?;
+            if existing.iter().any(|session| session.name == name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{name} already exists - attach to it with: termphin attach {name}"),
+                ));
+            }
+            name
+        }
+        None => free_name(&existing),
+    };
+    finish_attach(&name, platform::attach_person(&name)?);
+    Ok(())
+}
+
+fn finish_attach(name: &str, ending: Ending) {
+    match ending {
+        Ending::Detached => eprintln!("[detached from {name}]"),
+        Ending::Ended => eprintln!("[{name} ended]"),
+    }
+}
+
+/// How an attach a person started came to an end.
+pub(crate) enum Ending {
+    Detached,
+    Ended,
+}
+
+fn sessions() -> io::Result<Vec<SessionInfo>> {
+    Ok(platform::session_statuses()?
+        .iter()
+        .filter_map(|status| SessionInfo::parse(status))
+        .collect())
+}
+
+fn print_sessions() -> io::Result<()> {
+    let sessions = sessions()?;
+    if sessions.is_empty() {
+        println!("no sessions - start one with: termphin new");
+        return Ok(());
+    }
+    print!("{}", format_sessions(&sessions, unix_now()));
+    Ok(())
+}
+
+fn choose_session(sessions: &[SessionInfo]) -> io::Result<String> {
+    match sessions {
+        [] => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no sessions - start one with: termphin new",
+        )),
+        [only] => Ok(only.name.clone()),
+        _ => {
+            let now = unix_now();
+            for (index, session) in sessions.iter().enumerate() {
+                eprintln!("  {}) {}", index + 1, describe(session, now));
+            }
+            eprint!("attach to [1-{}]: ", sessions.len());
+            io::stderr().flush()?;
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer)?;
+            answer
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|choice| choice.checked_sub(1))
+                .and_then(|index| sessions.get(index))
+                .map(|session| session.name.clone())
+                .ok_or_else(|| invalid_input("no such session"))
+        }
+    }
+}
+
+fn free_name(existing: &[SessionInfo]) -> String {
+    let taken = |name: &str| existing.iter().any(|session| session.name == name);
+    if !taken("shell") {
+        return "shell".to_owned();
+    }
+    (2..)
+        .map(|n| format!("shell-{n}"))
+        .find(|name| !taken(name))
+        .expect("an unused name")
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// One line of `list`: name, protocol, creation time in Unix seconds and the
+/// number of clients attached.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SessionInfo {
+    pub(crate) name: String,
+    pub(crate) created_at: u64,
+    pub(crate) clients: usize,
+}
+
+impl SessionInfo {
+    pub(crate) fn parse(status: &str) -> Option<Self> {
+        let mut fields = status.split('\t');
+        let name = fields.next()?.to_owned();
+        let _protocol = fields.next()?;
+        let created_at = fields.next()?.parse().ok()?;
+        let clients = fields.next()?.parse().ok()?;
+        Some(Self {
+            name,
+            created_at,
+            clients,
+        })
+    }
+}
+
+fn describe(session: &SessionInfo, now: u64) -> String {
+    let clients = match session.clients {
+        0 => "detached".to_owned(),
+        1 => "1 client".to_owned(),
+        n => format!("{n} clients"),
+    };
+    format!(
+        "{}  {clients}, started {}",
+        session.name,
+        ago(now.saturating_sub(session.created_at))
+    )
+}
+
+pub(crate) fn format_sessions(sessions: &[SessionInfo], now: u64) -> String {
+    let width = sessions
+        .iter()
+        .map(|session| session.name.len())
+        .max()
+        .unwrap_or(0);
+    sessions
+        .iter()
+        .map(|session| {
+            let described = describe(session, now);
+            let rest = &described[session.name.len()..];
+            format!("{:width$}{rest}\n", session.name)
+        })
+        .collect()
+}
+
+fn ago(seconds: u64) -> String {
+    match seconds {
+        0..60 => "just now".to_owned(),
+        60..3600 => format!("{}m ago", seconds / 60),
+        3600..86400 => format!("{}h ago", seconds / 3600),
+        _ => format!("{}d ago", seconds / 86400),
+    }
+}
+
+/// Ctrl-\ then d, in an attach a person started. Ctrl-\ is otherwise only
+/// SIGQUIT, which a raw terminal does not generate; twice sends it on.
+pub(crate) const DETACH_PREFIX: u8 = 0x1c;
+
+#[derive(Default)]
+pub(crate) struct DetachKey {
+    armed: bool,
+}
+
+impl DetachKey {
+    /// The input to send on, and whether the detach key was pressed - in
+    /// which case whatever followed it is dropped with it.
+    pub(crate) fn feed(&mut self, input: &[u8]) -> (Vec<u8>, bool) {
+        let mut forward = Vec::with_capacity(input.len());
+        for &byte in input {
+            if self.armed {
+                self.armed = false;
+                match byte {
+                    b'd' => return (forward, true),
+                    DETACH_PREFIX => forward.push(DETACH_PREFIX),
+                    other => forward.extend([DETACH_PREFIX, other]),
+                }
+            } else if byte == DETACH_PREFIX {
+                self.armed = true;
+            } else {
+                forward.push(byte);
+            }
+        }
+        (forward, false)
+    }
+}
+
+/// Whose size the session's terminal takes: the client that last attached
+/// or typed. Two clients of different sizes cannot both be right, and the
+/// one in use is the one worth being right for.
+#[derive(Default)]
+pub(crate) struct Viewers {
+    recent: Vec<(u64, TermSize)>,
+}
+
+impl Viewers {
+    pub(crate) fn attached(&mut self, id: u64, size: TermSize) -> TermSize {
+        self.recent.retain(|(client, _)| *client != id);
+        self.recent.push((id, size));
+        size
+    }
+
+    /// The size to apply, if the client that resized is the one in use.
+    pub(crate) fn resized(&mut self, id: u64, size: TermSize) -> Option<TermSize> {
+        let entry = self.recent.iter_mut().find(|(client, _)| *client == id)?;
+        entry.1 = size;
+        self.is_active(id).then_some(size)
+    }
+
+    /// The size to apply, if typing made this client the one in use.
+    pub(crate) fn typed(&mut self, id: u64) -> Option<TermSize> {
+        if self.is_active(id) {
+            return None;
+        }
+        let index = self.recent.iter().position(|(client, _)| *client == id)?;
+        let entry = self.recent.remove(index);
+        self.recent.push(entry);
+        Some(entry.1)
+    }
+
+    /// The size to go back to, if the client in use left.
+    pub(crate) fn left(&mut self, id: u64) -> Option<TermSize> {
+        let was_active = self.is_active(id);
+        self.recent.retain(|(client, _)| *client != id);
+        if was_active {
+            self.recent.last().map(|(_, size)| *size)
+        } else {
+            None
+        }
+    }
+
+    fn is_active(&self, id: u64) -> bool {
+        self.recent.last().is_some_and(|(client, _)| *client == id)
+    }
 }
 
 fn print_version(machine: bool) {
@@ -544,6 +830,126 @@ pub(crate) struct ClientQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn size(cols: u16, rows: u16) -> TermSize {
+        TermSize { cols, rows }
+    }
+
+    #[test]
+    fn detach_key_detaches_and_keeps_what_came_before() {
+        let mut key = DetachKey::default();
+
+        assert_eq!(key.feed(b"ls\x1cd"), (b"ls".to_vec(), true));
+    }
+
+    #[test]
+    fn detach_key_split_across_reads_still_detaches() {
+        let mut key = DetachKey::default();
+
+        assert_eq!(key.feed(b"x\x1c"), (b"x".to_vec(), false));
+        assert_eq!(key.feed(b"d"), (Vec::new(), true));
+    }
+
+    #[test]
+    fn detach_prefix_twice_sends_one() {
+        let mut key = DetachKey::default();
+
+        assert_eq!(key.feed(b"\x1c\x1c"), (vec![DETACH_PREFIX], false));
+    }
+
+    #[test]
+    fn detach_prefix_before_anything_else_is_sent_as_typed() {
+        let mut key = DetachKey::default();
+
+        assert_eq!(key.feed(b"\x1cq"), (vec![DETACH_PREFIX, b'q'], false));
+        assert_eq!(key.feed(b"d"), (b"d".to_vec(), false));
+    }
+
+    #[test]
+    fn the_last_client_to_attach_sets_the_size() {
+        let mut viewers = Viewers::default();
+        viewers.attached(1, size(40, 20));
+
+        assert_eq!(viewers.attached(2, size(200, 50)), size(200, 50));
+        assert_eq!(viewers.resized(1, size(45, 20)), None);
+        assert_eq!(viewers.resized(2, size(180, 50)), Some(size(180, 50)));
+    }
+
+    #[test]
+    fn typing_hands_the_size_to_whoever_typed() {
+        let mut viewers = Viewers::default();
+        viewers.attached(1, size(40, 20));
+        viewers.attached(2, size(200, 50));
+
+        assert_eq!(viewers.typed(1), Some(size(40, 20)));
+        assert_eq!(viewers.typed(1), None, "already in use");
+        assert_eq!(viewers.resized(2, size(190, 50)), None);
+        assert_eq!(viewers.typed(2), Some(size(190, 50)));
+    }
+
+    #[test]
+    fn the_size_goes_back_when_the_client_in_use_leaves() {
+        let mut viewers = Viewers::default();
+        viewers.attached(1, size(40, 20));
+        viewers.attached(2, size(200, 50));
+
+        assert_eq!(viewers.left(1), None, "was not the one in use");
+        viewers.attached(3, size(100, 30));
+        assert_eq!(viewers.left(3), Some(size(200, 50)));
+        assert_eq!(viewers.left(2), None, "nobody left");
+    }
+
+    #[test]
+    fn a_status_line_is_read_back() {
+        assert_eq!(
+            SessionInfo::parse("work\t1\t1000\t2"),
+            Some(SessionInfo {
+                name: "work".to_owned(),
+                created_at: 1000,
+                clients: 2,
+            })
+        );
+        assert_eq!(SessionInfo::parse("work\t1"), None);
+    }
+
+    #[test]
+    fn sessions_are_listed_for_people() {
+        let sessions = [
+            SessionInfo {
+                name: "work".to_owned(),
+                created_at: 10_000 - 7200,
+                clients: 0,
+            },
+            SessionInfo {
+                name: "deploy-prod".to_owned(),
+                created_at: 10_000 - 30,
+                clients: 2,
+            },
+        ];
+
+        assert_eq!(
+            format_sessions(&sessions, 10_000),
+            "work         detached, started 2h ago\n\
+             deploy-prod  2 clients, started just now\n"
+        );
+    }
+
+    #[test]
+    fn a_new_session_gets_the_first_free_name() {
+        let named = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| SessionInfo {
+                    name: (*name).to_owned(),
+                    created_at: 0,
+                    clients: 0,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(free_name(&named(&[])), "shell");
+        assert_eq!(free_name(&named(&["shell", "shell-2"])), "shell-3");
+    }
 
     #[cfg(unix)]
     fn at(log: &OutputLog, offset: u64) -> OutputPosition {

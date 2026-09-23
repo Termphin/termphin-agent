@@ -62,6 +62,7 @@ jobs:
           chmod +x dist/termphin-agent-x86_64 dist/termphin-agent-aarch64 \
             dist/termphin-agent-macos-x86_64 dist/termphin-agent-macos-aarch64
           scripts/make_manifest.sh dist
+          cp scripts/install.sh scripts/install.ps1 dist/
       - name: Create release
         if: github.ref_type == 'tag'
         env:
