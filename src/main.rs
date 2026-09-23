@@ -509,6 +509,42 @@ impl DetachKey {
     }
 }
 
+/// Drops ConPTY's `CSI 8 ; rows ; cols t` from its output. It sends one after
+/// every resize to tell the terminal the new size, and a client whose own
+/// console obeys it shrinks to match whoever resized last - after which that
+/// client reports the wrong size itself. Only whole sequences inside `data`
+/// are dropped; ConPTY writes each in one piece.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn strip_resize_reports(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let mut kept: Option<Vec<u8>> = None;
+    let mut index = 0;
+    while index < data.len() {
+        if let Some(length) = resize_report_at(&data[index..]) {
+            kept.get_or_insert_with(|| data[..index].to_vec());
+            index += length;
+            continue;
+        }
+        if let Some(kept) = kept.as_mut() {
+            kept.push(data[index]);
+        }
+        index += 1;
+    }
+    match kept {
+        Some(kept) => std::borrow::Cow::Owned(kept),
+        None => std::borrow::Cow::Borrowed(data),
+    }
+}
+
+fn resize_report_at(data: &[u8]) -> Option<usize> {
+    let rest = data.strip_prefix(b"\x1b[8;")?;
+    let digits = |from: &[u8]| from.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    let rows = digits(rest);
+    let rest = rest.get(rows..)?.strip_prefix(b";").filter(|_| rows > 0)?;
+    let cols = digits(rest);
+    rest.get(cols..)?.strip_prefix(b"t").filter(|_| cols > 0)?;
+    Some(b"\x1b[8;".len() + rows + 1 + cols + 1)
+}
+
 /// Whose size the session's terminal takes: the client that last attached
 /// or typed. Two clients of different sizes cannot both be right, and the
 /// one in use is the one worth being right for.
@@ -830,6 +866,29 @@ pub(crate) struct ClientQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_reports_are_dropped_and_nothing_else() {
+        assert_eq!(
+            &*strip_resize_reports(b"a\x1b[8;12;40tb\x1b[8;30;100t"),
+            b"ab"
+        );
+        assert_eq!(
+            &*strip_resize_reports(b"\x1b[31mred\x1b[0m"),
+            b"\x1b[31mred\x1b[0m"
+        );
+        assert_eq!(&*strip_resize_reports(b"\x1b[8;12t"), b"\x1b[8;12t");
+        assert_eq!(&*strip_resize_reports(b"\x1b[8;;40t"), b"\x1b[8;;40t");
+        assert_eq!(&*strip_resize_reports(b"\x1b[8;12;40"), b"\x1b[8;12;40");
+    }
+
+    #[test]
+    fn output_without_a_resize_report_is_not_copied() {
+        assert!(matches!(
+            strip_resize_reports(b"plain"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
 
     fn size(cols: u16, rows: u16) -> TermSize {
         TermSize { cols, rows }

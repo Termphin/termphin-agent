@@ -57,7 +57,7 @@ use crate::{
     FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_STATUS, FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT,
     History, MAX_CLIENTS, REPLAY_CHUNK_SIZE, REPLAY_END_MARKER, RestoreState,
     SCROLLBACK_FLUSH_EVERY_TICKS, SESSION_ENV, TermSize, Viewers, decode_size, encode_size,
-    invalid_input, read_frame, send_frame, validate_name,
+    invalid_input, read_frame, send_frame, strip_resize_reports, validate_name,
 };
 
 /// Ten cheap console reads a second, against a visible lag on every rotation
@@ -1200,7 +1200,12 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
         loop {
             match pty_read.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(count) => reader_state.broadcast_output(&buffer[..count]),
+                Ok(count) => {
+                    let output = strip_resize_reports(&buffer[..count]);
+                    if !output.is_empty() {
+                        reader_state.broadcast_output(&output);
+                    }
+                }
                 Err(error) if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) => break,
                 Err(_) => break,
             }
