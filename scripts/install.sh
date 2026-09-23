@@ -2,7 +2,7 @@
 # Installs termphin-agent where the Termphin app keeps it, or finds the copy
 # the app already installed, and puts `termphin` on PATH.
 #
-#   curl -fsSL https://github.com/Termphin/termphin-agent/releases/latest/download/install.sh | sh
+#   curl -fsSL https://termphin.dev/install.sh | sh
 #
 # TERMPHIN_BASE_URL points it at another copy of the release assets.
 

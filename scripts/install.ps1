@@ -1,7 +1,7 @@
 # Installs termphin-agent where the Termphin app keeps it, or finds the copy
 # the app already installed, and puts `termphin` on the user's PATH.
 #
-#   irm https://github.com/Termphin/termphin-agent/releases/latest/download/install.ps1 | iex
+#   irm https://termphin.dev/install.ps1 | iex
 #
 # TERMPHIN_BASE_URL points it at another copy of the release assets.
 

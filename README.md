@@ -64,11 +64,11 @@ terminal on the server - pick up on a laptop what you started on the phone -
 put it on your PATH as `termphin`:
 
 ```sh
-curl -fsSL https://github.com/Termphin/termphin-agent/releases/latest/download/install.sh | sh
+curl -fsSL https://termphin.dev/install.sh | sh
 ```
 
 ```powershell
-irm https://github.com/Termphin/termphin-agent/releases/latest/download/install.ps1 | iex
+irm https://termphin.dev/install.ps1 | iex
 ```
 
 Where the app has already installed the agent, the script only links it:
