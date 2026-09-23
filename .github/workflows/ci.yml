@@ -47,6 +47,13 @@ jobs:
       - name: Build
         run: cargo build --release --target x86_64-pc-windows-gnu
 
+      # A build to try on a real Windows host before anything is tagged.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: termphin-agent-windows-x86_64
+          path: target/x86_64-pc-windows-gnu/release/termphin-agent.exe
+          if-no-files-found: error
+
   macos:
     runs-on: macos-latest
 
