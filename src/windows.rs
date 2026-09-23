@@ -1208,6 +1208,17 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
         reader_state.finish();
     });
 
+    // ConPTY holds its output pipe open after the shell exits, until it is
+    // closed - so without this an `exit` would leave the session listed, and
+    // its clients attached to nothing, for good.
+    let exit_state = Arc::clone(&state);
+    let shell = RawHandle(state.child.process);
+    thread::spawn(move || {
+        let shell = shell;
+        unsafe { WaitForSingleObject(shell.0, INFINITE) };
+        exit_state.close_pseudo_console();
+    });
+
     let persistence_state = Arc::clone(&state);
     thread::spawn(move || {
         let mut tick: u32 = 0;
