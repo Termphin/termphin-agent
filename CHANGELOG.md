@@ -8,6 +8,8 @@
 - A command line for people as well as the app. `install.sh` and `install.ps1` put the agent on PATH as `termphin`, installing it first if the app has not. `termphin attach` without a name picks the only session or offers a choice, `termphin new` starts one, `termphin ls` lists them. `Ctrl-\` then `d` detaches, and resets the terminal's modes on the way out.
 - With several clients attached, the session takes the size of whichever last attached or typed, and goes back to the previous one's when it leaves, rather than each resize fighting the last.
 - A session's shell has `TERMPHIN_SESSION` set, and `termphin attach` refuses to run inside one.
+- Fixed a Windows session outliving its shell: after `exit` the master stayed up and the session stayed listed, because ConPTY keeps its output open until it is closed.
+- Fixed Windows clients shrinking each other: ConPTY reports every resize to the terminal, and a client whose console obeyed took on whoever resized last as its own size.
 
 ## 0.11.0 - 2026-08-28
 
