@@ -1,10 +1,10 @@
-[![Termphin - an SSH client whose sessions survive the dropped connection](https://termphin.dev/gh-banner.webp?v=3)](https://termphin.dev)
-
-The server-side half of [Termphin](https://termphin.dev), an SSH client whose
-sessions survive the dropped connection. This is the part that runs on your
-machine, built and released separately.
+[![Termphin: SSH that survives the dropped connection](https://termphin.dev/og-image.png)](https://termphin.dev)
 
 # termphin-agent
+
+The server-side half of [Termphin](https://termphin.dev), an SSH client whose
+sessions survive a dropped connection. This is the part that runs on your
+machine, built and released separately.
 
 Keeps one remote shell alive while Termphin is disconnected, so a session
 survives losing the network, backgrounding the app or closing it. Termphin
@@ -26,42 +26,44 @@ The part worth reading before letting anything run on a machine you care about.
 - **No privileges.** Runs as your user. Nothing is installed system-wide, no
   setuid, no service unit, no cron entry.
 - **Everything lives under `~/.cache/termphin/sessions`** (`%LOCALAPPDATA%\termphin\sessions`
-  on Windows). One directory per session holding the socket and a `created_at`
-  stamp. Killing a session removes its directory; nothing else on disk is
-  touched.
+  on Windows). One directory per session holds the socket, a `created_at`
+  stamp and a `scrollback` snapshot. Killing a session removes its directory.
+  Nothing else on disk is touched.
 - **It starts your `$SHELL`** (or `/bin/sh`) as a login shell on a PTY, and
   passes bytes between that PTY and the socket unchanged. On Windows that's
   `powershell.exe` on a ConPTY pseudo console instead.
-- **Scrollback is held in memory only**, the last 2000 rows of the session's
-  terminal state. It is never written to disk, except a periodic snapshot so a
-  reboot can restore it.
-- **Two dependencies on Unix**, `libc` and `vt100`, over about 1400 lines of
-  one file, small enough to read in an afternoon. Windows needs `windows-sys`
-  for ConPTY and named pipes and is a separate module.
+- **Scrollback is kept in memory**, the last 2000 rows of the session's
+  terminal state. A snapshot is written to the session directory every 30
+  seconds so a reboot can restore it.
+- **Two dependencies on Unix**, `libc` and `vt100`, and about 3000 lines of
+  code in `src/main.rs` and `src/unix.rs`. Small enough to read in an
+  afternoon. Windows uses `windows-sys` for ConPTY and named pipes and lives in
+  its own module.
 
 Authorization is the filesystem (or, on Windows, the pipe's ACL). Anyone who
 can reach it is already running as your user, and could read the PTY anyway.
 
-Windows has one gap against the Unix build: a live terminal resize during an
-attach is polled every 100ms rather than delivered instantly - see the module
-doc in `src/windows.rs` for why. The shell's working directory *is* tracked,
-but by a different route: PowerShell's `cd` never touches the process's real
-OS-level directory, so there is no `/proc/<pid>/cwd` equivalent to read from
-outside. Instead the shell is started with a `prompt` function - chained onto
-whatever the user's own profile defines, never replacing it - that reports
-`$PWD` over an OSC marker. It rides in on `-EncodedCommand` so the shell
-never echoes it. Persistence itself - a session surviving the
-SSH connection that started it - relies on the new master process breaking
-away from whatever job object owns the SSH session (Win32-OpenSSH's, usually).
-If that job doesn't permit breakaway, the session just doesn't outlive the
-connection, the same as a session that didn't shut down cleanly for any other
-reason - there is no separate "unsupported" mode.
+### Windows
+
+A few things work differently on Windows:
+
+- **Resize** during an attach is polled every 100ms instead of delivered
+  instantly. The module doc in `src/windows.rs` explains why.
+- **The working directory** cannot be read from outside the process, because
+  PowerShell's `cd` does not change the process's real directory. The shell
+  is started with a `prompt` function that reports `$PWD` over an OSC marker.
+  It is chained onto the user's own prompt, not replacing it, and is passed
+  with `-EncodedCommand` so the shell never echoes it.
+- **Persistence** needs the master process to break away from the job object
+  that owns the SSH session (usually Win32-OpenSSH's). If the job does not
+  allow that, the session ends with the connection, like any session that did
+  not shut down cleanly. There is no separate "unsupported" mode.
 
 ## Using it from a terminal
 
 The app installs the agent on its own. To reach the same sessions from a
-terminal on the server - pick up on a laptop what you started on the phone -
-put it on your PATH as `termphin`:
+terminal on the server, for example to continue on a laptop what you started
+on your phone, put it on your PATH as `termphin`:
 
 ```sh
 curl -fsSL https://termphin.dev/install.sh | sh
@@ -71,13 +73,12 @@ curl -fsSL https://termphin.dev/install.sh | sh
 irm https://termphin.dev/install.ps1 | iex
 ```
 
-Where the app has already installed the agent, the script only links it:
+If the app has already installed the agent, the script only links it:
 `~/.local/bin/termphin` on Linux and macOS (adding that directory to your shell
-profile if it is not on PATH), a `termphin.cmd` beside the binary on Windows,
-whose directory goes on your user PATH. Otherwise it downloads the release
-binary into the same place the app uses, checks it against the release's
-checksum and writes the metadata the app reads, so the two never fight over
-which copy is current.
+profile if needed), or a `termphin.cmd` next to the binary on Windows, with
+that directory added to your user PATH. Otherwise it downloads the release
+binary into the same place the app uses, verifies its checksum and writes the
+metadata the app reads, so both always agree on which copy is current.
 
 ```text
 termphin attach [name]    attach, choosing one if there are several
@@ -85,14 +86,14 @@ termphin new [name]       start a session and attach to it
 termphin ls               list sessions
 ```
 
-Detach with `Ctrl-\` then `d`; `Ctrl-\` twice sends one on. Detaching resets
-whatever modes a program left your terminal in - the alternate screen, mouse
-reporting, a hidden cursor.
+Detach with `Ctrl-\` then `d`. Press `Ctrl-\` twice to send it to the
+program. Detaching resets any modes a program left your terminal in, such as
+the alternate screen, mouse reporting or a hidden cursor.
 
-Several clients can be attached at once. The session takes the size of
-whichever one last attached or typed, and goes back to the previous one's when
-that one leaves - a phone and a laptop cannot both have their own width, so
-the one in use gets it.
+Several clients can be attached at once. A phone and a laptop cannot both have
+their own width, so the session takes the size of whichever client last
+attached or typed, and goes back to the previous size when that client
+leaves.
 
 `attach` from inside a session is refused: every session's shell has
 `TERMPHIN_SESSION` set to its name. Unset it to nest on purpose.
@@ -110,13 +111,13 @@ termphin-agent kill <name>
 termphin-agent version --machine
 ```
 
-`attach` with `--replay` or `--resume` is the app's: no detach key, no choice,
-the name required. `list` prints one tab-separated line per session for the
-app to parse, `ls` the same for people.
+`attach` with `--replay` or `--resume` is what the app uses: no detach key, no
+session picker, and the name is required. `list` prints one tab-separated line
+per session for the app to parse. `ls` shows the same for people.
 
 Each session has a master process and a Unix socket below
 `~/.cache/termphin/sessions`. The attach client forwards terminal resize events
-to the child PTY. The master keeps the session's terminal state - 2000 rows of
+to the child PTY. The master keeps the session's terminal state: 2000 rows of
 scrollback, the screen, and the active DEC private terminal modes.
 
 `--replay` reconstructs a fresh local terminal's scrollback and modes. The
@@ -134,8 +135,8 @@ starts at, which the client counts on from to know where to resume next time.
 The epoch is new for every master, so a position from an earlier one of the
 same name is refused rather than misread. When the position is not there, the
 master replays instead; `--replay` alongside is what makes that fallback a
-full scrollback. Unix only - ConPTY re-renders output on Windows, so the
-counts would not match, and the flag is ignored there.
+full scrollback. Resume is Unix only. ConPTY re-renders output on Windows, so
+the offsets would not match, and the flag is ignored there.
 
 On attach the master also briefly changes the PTY height while the alternate
 screen is active. That buffer has no scrollback to reconstruct, so the
