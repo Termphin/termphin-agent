@@ -34,7 +34,7 @@ use windows_sys::Win32::System::Console::{
     CONSOLE_SCREEN_BUFFER_INFO, COORD, ClosePseudoConsole, CreatePseudoConsole,
     ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode,
     GetConsoleScreenBufferInfo, GetStdHandle, HPCON, ResizePseudoConsole, STD_INPUT_HANDLE,
-    STD_OUTPUT_HANDLE, SetConsoleMode,
+    STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, SetConsoleMode,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
@@ -633,6 +633,10 @@ fn spawn_conpty_shell(
     ))
 }
 
+/// The shell gets neither a process group of its own nor the master's
+/// "ignore Ctrl+C", which the master has from being started in one: either
+/// leaves the shell ignoring Ctrl+C, so a Ctrl+C typed into the session would
+/// stop nothing.
 fn spawn_attached_process(command_line: &str, hpc: HPCON) -> io::Result<ChildProcess> {
     unsafe {
         let mut size: usize = 0;
@@ -665,7 +669,8 @@ fn spawn_attached_process(command_line: &str, hpc: HPCON) -> io::Result<ChildPro
         // No CREATE_NO_WINDOW here: it is not part of Microsoft's own ConPTY
         // sample and appears to interfere with the pseudo console attachment
         // itself rather than being a harmless no-op.
-        let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_PROCESS_GROUP;
+        let flags = EXTENDED_STARTUPINFO_PRESENT;
+        SetConsoleCtrlHandler(None, 0);
 
         let ok = CreateProcessW(
             std::ptr::null(),
