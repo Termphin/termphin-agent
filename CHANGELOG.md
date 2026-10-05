@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.12.1 - 2026-10-05
 
 - Fixed Ctrl+C not stopping a running command in a Windows session.
 
