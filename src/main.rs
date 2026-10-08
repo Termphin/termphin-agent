@@ -825,9 +825,19 @@ impl History {
         let mut output = Vec::new();
         for n in (1..=depth).rev() {
             screen.set_scrollback(n);
-            if let Some(line) = screen.rows(0, cols).next() {
-                output.extend(line.trim_end().as_bytes());
-                output.extend(b"\r\n");
+            if let Some(line) = screen.rows_formatted(0, cols).next() {
+                output.extend(line);
+                output.extend(b"\x1b[m");
+
+                let should_skip_crlf = n > 1
+                    && screen.row_wrapped(0)
+                    && screen
+                        .cell(0, cols - 1)
+                        .is_some_and(|cell| cell.has_contents() || cell.is_wide_continuation());
+
+                if !should_skip_crlf {
+                    output.extend(b"\r\n");
+                }
             }
         }
         output.extend(std::iter::repeat_n(
@@ -1201,6 +1211,43 @@ mod tests {
         );
     }
 
+    fn assert_same_scrollback(expected: &mut History, replayed: &mut vt100::Parser) {
+        expected.parser.screen_mut().set_scrollback(usize::MAX);
+        replayed.screen_mut().set_scrollback(usize::MAX);
+
+        let expected_depth = expected.parser.screen().scrollback();
+        let replayed_depth = replayed.screen().scrollback();
+        assert_eq!(expected_depth, replayed_depth, "scrollback depth mismatch");
+
+        let (_, cols) = expected.parser.screen().size();
+
+        for n in (1..=expected_depth).rev() {
+            expected.parser.screen_mut().set_scrollback(n);
+            replayed.screen_mut().set_scrollback(n);
+
+            for col in 0..cols {
+                let expected_cell = expected.parser.screen().cell(0, col);
+                let replayed_cell = replayed.screen().cell(0, col);
+                assert_eq!(
+                    expected_cell, replayed_cell,
+                    "scrollback cell mismatch at offset {n} col {col}"
+                );
+            }
+
+            if n > 1 {
+                let expected_wrapped = expected.parser.screen().row_wrapped(0);
+                let replayed_wrapped = replayed.screen().row_wrapped(0);
+                assert_eq!(
+                    expected_wrapped, replayed_wrapped,
+                    "row_wrapped mismatch at offset {n}"
+                );
+            }
+        }
+
+        expected.parser.screen_mut().set_scrollback(0);
+        replayed.screen_mut().set_scrollback(0);
+    }
+
     #[test]
     fn seed_restored_carries_scrollback_and_marks_it() {
         let mut history = History::new(24, 80);
@@ -1395,5 +1442,69 @@ mod tests {
                 .chunks(REPLAY_CHUNK_SIZE)
                 .all(|chunk| chunk.len() <= MAX_FRAME_SIZE)
         );
+    }
+
+    #[test]
+    fn scrollback_keeps_colours_and_attributes() {
+        let mut history = History::new(5, 20);
+        history.push(b"\x1b[31mred\x1b[0m plain\r\n");
+        history.push(b"\x1b[1;4mbold\x1b[0m\r\n");
+        history.push(b"\x1b[38;5;208mx\x1b[48;2;1;2;3my\x1b[0m\r\n");
+        for i in 0..10 {
+            history.push(format!("plain line {i}\r\n").as_bytes());
+        }
+
+        let snapshot = history.snapshot();
+        let mut replayed = vt100::Parser::new(5, 20, SCROLLBACK_ROWS);
+        replayed.process(&snapshot);
+
+        assert_same_scrollback(&mut history, &mut replayed);
+
+        replayed.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(
+            replayed.screen().cell(0, 0).unwrap().fgcolor(),
+            vt100::Color::Idx(1)
+        );
+    }
+
+    #[test]
+    fn scrollback_keeps_coloured_blank_tail() {
+        let mut history = History::new(5, 20);
+        history.push(b"\x1b[44mab\x1b[K\x1b[0m\r\n");
+        for i in 0..10 {
+            history.push(format!("plain line {i}\r\n").as_bytes());
+        }
+
+        let snapshot = history.snapshot();
+        let mut replayed = vt100::Parser::new(5, 20, SCROLLBACK_ROWS);
+        replayed.process(&snapshot);
+
+        assert_same_scrollback(&mut history, &mut replayed);
+
+        replayed.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(
+            replayed.screen().cell(0, 15).unwrap().bgcolor(),
+            vt100::Color::Idx(4)
+        );
+    }
+
+    #[test]
+    fn wrapped_scrollback_lines_stay_joined() {
+        let mut history = History::new(5, 20);
+        let long_line = "x".repeat(45);
+        history.push(format!("{long_line}\r\n").as_bytes());
+        for i in 0..10 {
+            history.push(format!("plain line {i}\r\n").as_bytes());
+        }
+
+        let snapshot = history.snapshot();
+        let mut replayed = vt100::Parser::new(5, 20, SCROLLBACK_ROWS);
+        replayed.process(&snapshot);
+
+        assert_same_scrollback(&mut history, &mut replayed);
+
+        replayed.screen_mut().set_scrollback(usize::MAX);
+        let contents = replayed.screen().contents();
+        assert!(contents.contains(&long_line));
     }
 }
