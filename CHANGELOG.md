@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.0 - 2026-10-08
+
+- Fixed history losing its colours on reattach.
+
 ## 0.12.1 - 2026-10-05
 
 - Fixed Ctrl+C not stopping a running command in a Windows session.
