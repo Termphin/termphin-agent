@@ -478,6 +478,8 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
             pty: Mutex::new(writer),
             clients: Mutex::new(HashMap::new()),
             history: Mutex::new(history),
+            notifications: Mutex::new(crate::relay::NotificationScanner::default()),
+            relay: Mutex::new(crate::relay::Relay::default()),
             viewers: Mutex::new(Viewers::default()),
             shell_killed: AtomicBool::new(false),
             exiting: AtomicBool::new(false),
@@ -766,6 +768,10 @@ struct MasterState {
     pty: Mutex<File>,
     clients: Mutex<HashMap<u64, Arc<ClientChannel>>>,
     history: Mutex<History>,
+    /// Watches the output for notifications a program asks for, so one sent
+    /// while nobody is attached can still go out through the relay.
+    notifications: Mutex<crate::relay::NotificationScanner>,
+    relay: Mutex<crate::relay::Relay>,
     viewers: Mutex<Viewers>,
     /// Separate from [`Self::exiting`] on purpose: sharing one flag meant an
     /// explicit `kill` marked the session wound down, and [`Self::finish`]
@@ -858,8 +864,17 @@ impl MasterState {
     fn broadcast_output(&self, data: &[u8]) {
         let mut history = self.history.lock().expect("history mutex poisoned");
         history.push(data);
+        let found = self
+            .notifications
+            .lock()
+            .expect("notifications mutex poisoned")
+            .feed(data);
         let clients = self.clients.lock().expect("clients mutex poisoned");
         if clients.is_empty() {
+            let mut relay = self.relay.lock().expect("relay mutex poisoned");
+            for (title, body) in found {
+                relay.send(&title, &body);
+            }
             return;
         }
         let failed = clients

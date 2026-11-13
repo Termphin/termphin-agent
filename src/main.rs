@@ -6,6 +6,8 @@ use std::process;
 use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
+mod relay;
+#[cfg(unix)]
 mod unix;
 #[cfg(windows)]
 mod windows;
