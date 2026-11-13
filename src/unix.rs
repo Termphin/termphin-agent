@@ -978,12 +978,13 @@ impl MasterState {
             *last_cwd = Some(cwd);
         }
         if force_scrollback {
-            let snapshot = self
-                .history
-                .lock()
-                .expect("history mutex poisoned")
-                .snapshot();
-            let _ = fs::write(directory.join("scrollback"), snapshot);
+            let snapshot = {
+                let mut history = self.history.lock().expect("history mutex poisoned");
+                history.take_unsaved().then(|| history.snapshot())
+            };
+            if let Some(snapshot) = snapshot {
+                let _ = fs::write(directory.join("scrollback"), snapshot);
+            }
         }
     }
 

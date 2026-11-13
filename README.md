@@ -32,9 +32,11 @@ The part worth reading before letting anything run on a machine you care about.
 - **It starts your `$SHELL`** (or `/bin/sh`) as a login shell on a PTY, and
   passes bytes between that PTY and the socket unchanged. On Windows that's
   `powershell.exe` on a ConPTY pseudo console instead.
-- **Scrollback is kept in memory**, the last 2000 rows of the session's
-  terminal state. A snapshot is written to the session directory every 30
-  seconds so a reboot can restore it.
+- **Scrollback is kept in memory**, the last 10 000 rows of the session's
+  terminal state - a few megabytes for a long session, up to a few tens for
+  one that is both long and wide. A snapshot is written to the session
+  directory every 30 seconds while there is something new, so a reboot can
+  restore it.
 - **Two dependencies on Unix**, `libc` and `vt100`, and about 3000 lines of
   code in `src/main.rs` and `src/unix.rs`. Small enough to read in an
   afternoon. Windows uses `windows-sys` for ConPTY and named pipes and lives in
@@ -117,7 +119,7 @@ per session for the app to parse. `ls` shows the same for people.
 
 Each session has a master process and a Unix socket below
 `~/.cache/termphin/sessions`. The attach client forwards terminal resize events
-to the child PTY. The master keeps the session's terminal state: 2000 rows of
+to the child PTY. The master keeps the session's terminal state: 10 000 rows of
 scrollback, the screen, and the active DEC private terminal modes.
 
 `--replay` reconstructs a fresh local terminal's scrollback and modes. The
