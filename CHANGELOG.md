@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `termphin notify [title] [body]` shows a notification in Termphin, for the end of a long command or as a Claude Code hook.
+
 ## 0.14.0 - 2026-11-13
 
 - Scrollback kept and replayed is 10 000 rows, up from 2000.
