@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.14.0 - 2026-11-13
+
+- Scrollback kept and replayed is 10 000 rows, up from 2000.
+- The scrollback snapshot is only written when something changed.
+
 ## 0.13.0 - 2026-10-08
 
 - Fixed history losing its colours on reattach.

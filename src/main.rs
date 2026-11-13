@@ -742,7 +742,9 @@ impl RestoreState {
     }
 }
 
-pub(crate) const SCROLLBACK_ROWS: usize = 2000;
+/// As many rows as the app's own terminal keeps, so a replay gives back
+/// everything the app could have been showing.
+pub(crate) const SCROLLBACK_ROWS: usize = 10_000;
 
 #[derive(Default, Clone)]
 struct TitleTracker {
@@ -760,6 +762,8 @@ pub(crate) struct History {
     title: Arc<Mutex<Option<Vec<u8>>>>,
     restored: bool,
     #[cfg(unix)]
+    unsaved: bool,
+    #[cfg(unix)]
     output: OutputLog,
 }
 
@@ -776,6 +780,8 @@ impl History {
             title: tracker.title,
             restored: false,
             #[cfg(unix)]
+            unsaved: true,
+            #[cfg(unix)]
             output: OutputLog::new(OUTPUT_LOG_BYTES),
         }
     }
@@ -783,7 +789,19 @@ impl History {
     pub(crate) fn push(&mut self, data: &[u8]) {
         self.parser.process(data);
         #[cfg(unix)]
-        self.output.push(data);
+        {
+            self.unsaved = true;
+            self.output.push(data);
+        }
+    }
+
+    /// Whether anything changed since this was last asked, which is what
+    /// the snapshot on disk is behind by. A session nobody is using has
+    /// nothing new to save, and its snapshot - thousands of rows - is not
+    /// written out again every interval just the same.
+    #[cfg(unix)]
+    pub(crate) fn take_unsaved(&mut self) -> bool {
+        std::mem::replace(&mut self.unsaved, false)
     }
 
     #[cfg(unix)]
@@ -793,6 +811,10 @@ impl History {
 
     pub(crate) fn resize(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows.max(1), cols.max(1));
+        #[cfg(unix)]
+        {
+            self.unsaved = true;
+        }
     }
 
     pub(crate) fn snapshot(&mut self) -> Vec<u8> {
@@ -1424,6 +1446,31 @@ mod tests {
         let screen = replayed.screen().contents();
         assert!(screen.contains("line 28"));
         assert!(screen.contains("prompt $ "));
+    }
+
+    #[test]
+    fn scrollback_keeps_ten_thousand_rows() {
+        let mut history = History::new(5, 20);
+        for index in 0..12_000 {
+            history.push(format!("line {index:05}\r\n").as_bytes());
+        }
+        let snapshot = String::from_utf8(history.snapshot()).unwrap();
+        assert!(snapshot.contains("line 02100"));
+        assert!(snapshot.contains("line 11999"));
+        assert!(!snapshot.contains("line 01900"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_changed_history_asks_to_be_saved() {
+        let mut history = History::new(5, 20);
+        assert!(history.take_unsaved());
+        assert!(!history.take_unsaved());
+        history.push(b"output");
+        assert!(history.take_unsaved());
+        assert!(!history.take_unsaved());
+        history.resize(6, 20);
+        assert!(history.take_unsaved());
     }
 
     #[test]
