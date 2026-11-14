@@ -1744,9 +1744,39 @@ fn can_take_over(path: &Path) -> bool {
         && run("__resume-capable").as_deref() == Some(&crate::RESUME_FORMAT.to_string())
 }
 
+/// What to go on when the handover cannot be read - removed, cut short by
+/// a full disk, from a format this binary does not know. The terminal and
+/// the shell are still here, which is what matters: the shell is the
+/// session leader of the terminal, so it is found from the terminal
+/// itself, and the session carries on with only its scrollback lost.
+fn lost_handover(name: &str, pty_fd: RawFd, directory: &Path) -> Handover {
+    let shell_pid = unsafe { libc::tcgetsid(pty_fd) };
+    let created_at = fs::read_to_string(directory.join("created_at"))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        });
+    Handover {
+        name: name.to_owned(),
+        created_at,
+        shell_pid,
+        epoch: 0,
+        total: 0,
+        restored: false,
+    }
+}
+
 /// The other half of [`MasterState::exec_into`]: the master as the newer
 /// binary, picking up the session from the handover. `args` are the
 /// session's name and the fds of its terminal and control socket.
+///
+/// It never gives up on the session once it has the terminal: exiting here
+/// would close the terminal and hang up the shell and everything running
+/// in it. A handover it cannot read costs the scrollback, nothing more.
 pub(crate) fn resume_master(args: Vec<String>) -> io::Result<()> {
     let [name, pty_fd, listener_fd] = args.as_slice() else {
         return Err(invalid_input(
@@ -1763,13 +1793,12 @@ pub(crate) fn resume_master(args: Vec<String>) -> io::Result<()> {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
-    install_master_sigterm_handler()?;
+    let _ = install_master_sigterm_handler();
 
     let directory = session_dir(name)?;
     let handover = fs::read_to_string(directory.join(HANDOVER_FILE))
         .ok()
-        .and_then(|text| Handover::decode(&text))
-        .ok_or_else(|| invalid_input("no handover to resume from"))?;
+        .and_then(|text| Handover::decode(&text));
     let screen = fs::read(directory.join(HANDOVER_SCREEN_FILE)).unwrap_or_default();
     let output = fs::read(directory.join(HANDOVER_OUTPUT_FILE)).unwrap_or_default();
     for file in [HANDOVER_FILE, HANDOVER_SCREEN_FILE, HANDOVER_OUTPUT_FILE] {
@@ -1783,16 +1812,22 @@ pub(crate) fn resume_master(args: Vec<String>) -> io::Result<()> {
     unsafe {
         libc::ioctl(pty_fd, libc::TIOCGWINSZ as _, &mut size);
     }
-    let history = History::resumed(
-        size.ws_row,
-        size.ws_col,
-        &screen,
+    let handover = handover.unwrap_or_else(|| lost_handover(name, pty_fd, &directory));
+    let output_log = if handover.total > 0 || !output.is_empty() {
         crate::OutputLog::from_parts(
             handover.epoch,
             handover.total,
             &output,
             crate::OUTPUT_LOG_BYTES,
-        ),
+        )
+    } else {
+        crate::OutputLog::new(crate::OUTPUT_LOG_BYTES)
+    };
+    let history = History::resumed(
+        size.ws_row,
+        size.ws_col,
+        &screen,
+        output_log,
         handover.restored,
     );
     let state = Arc::new(MasterState {
@@ -1828,6 +1863,48 @@ fn close_fd(fd: RawFd) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lost_handover_still_finds_the_shell_from_the_terminal() {
+        let size = unsafe { std::mem::zeroed::<libc::winsize>() };
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        assert_eq!(
+            unsafe { call_openpty(&mut master_fd, &mut slave_fd, &size) },
+            0
+        );
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe {
+                for fd in 3..1024 {
+                    if fd != slave_fd {
+                        libc::close(fd);
+                    }
+                }
+                libc::setsid();
+                libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
+                libc::sleep(5);
+                libc::_exit(0);
+            }
+        }
+        thread::sleep(Duration::from_millis(200));
+        let directory = env::temp_dir().join(format!("termphin-lost-{}", process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("created_at"), "1794600000").unwrap();
+
+        let handover = lost_handover("t1", master_fd, &directory);
+
+        assert_eq!(handover.shell_pid, child);
+        assert_eq!(handover.created_at, 1_794_600_000);
+        assert_eq!(handover.name, "t1");
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            libc::waitpid(child, std::ptr::null_mut(), 0);
+        }
+        close_fd(master_fd);
+        close_fd(slave_fd);
+        let _ = fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn a_handover_reads_back_as_written() {
