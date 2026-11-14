@@ -18,10 +18,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use windows_sys::Wdk::System::Threading::{
+    NtQueryInformationProcess, ProcessCommandLineInformation,
+};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
     GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
+use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, UNICODE_STRING};
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION,
 };
@@ -36,6 +40,9 @@ use windows_sys::Win32::System::Console::{
     GetConsoleScreenBufferInfo, GetStdHandle, HPCON, ResizePseudoConsole, STD_INPUT_HANDLE,
     STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, SetConsoleMode,
 };
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
@@ -45,9 +52,10 @@ use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CreateEventW,
     CreateMutexW, CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, INFINITE, InitializeProcThreadAttributeList,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ReleaseMutex, STARTUPINFOEXW,
-    STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, GetProcessId, INFINITE, InitializeProcThreadAttributeList,
+    OpenProcess, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, ReleaseMutex, STARTUPINFOEXW, STARTUPINFOW,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use crate::win32_codec::{CWD_PROMPT_HOOK, Win32InputDecoder, base64_utf16le};
@@ -594,6 +602,85 @@ fn shell_command_line() -> String {
     )
 }
 
+/// Processes that belong to the console itself, not to anything the user
+/// ran: ConPTY starts its host as a child of the shell.
+const CONSOLE_HOSTS: [&str; 2] = ["conhost.exe", "openconsole.exe"];
+
+/// The command the shell [shell] is running: its newest child process other
+/// than the console host. Windows has no foreground process group to ask,
+/// and a command the shell runs is its child - a pipeline's processes are
+/// all children, the newest standing for it.
+fn running_command(shell: u32) -> Option<u32> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut entry = unsafe { std::mem::zeroed::<PROCESSENTRY32W>() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut newest = None;
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while more {
+        if entry.th32ParentProcessID == shell {
+            let length = entry
+                .szExeFile
+                .iter()
+                .position(|&unit| unit == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let name = String::from_utf16_lossy(&entry.szExeFile[..length]).to_lowercase();
+            if !CONSOLE_HOSTS.contains(&name.as_str()) {
+                newest = Some(entry.th32ProcessID);
+            }
+        }
+        more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    newest
+}
+
+/// How a notification names the command running as process [pid]: its
+/// command line, split as Windows programs split theirs, through
+/// [`crate::relay::command_label`].
+fn command_name(pid: i32) -> Option<String> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32) };
+    if process.is_null() {
+        return None;
+    }
+    let mut buffer = vec![0_u64; 512];
+    let mut needed = 0_u32;
+    let mut status = unsafe {
+        NtQueryInformationProcess(
+            process,
+            ProcessCommandLineInformation,
+            buffer.as_mut_ptr().cast(),
+            (buffer.len() * 8) as u32,
+            &mut needed,
+        )
+    };
+    if status < 0 && needed as usize > buffer.len() * 8 {
+        buffer = vec![0_u64; (needed as usize).div_ceil(8)];
+        status = unsafe {
+            NtQueryInformationProcess(
+                process,
+                ProcessCommandLineInformation,
+                buffer.as_mut_ptr().cast(),
+                (buffer.len() * 8) as u32,
+                &mut needed,
+            )
+        };
+    }
+    unsafe { CloseHandle(process) };
+    if status < 0 {
+        return None;
+    }
+    let text = unsafe { &*buffer.as_ptr().cast::<UNICODE_STRING>() };
+    if text.Buffer.is_null() || text.Length == 0 {
+        return None;
+    }
+    let units = unsafe { std::slice::from_raw_parts(text.Buffer, usize::from(text.Length) / 2) };
+    let line = String::from_utf16_lossy(units);
+    crate::relay::command_label(&crate::relay::split_command_line(&line))
+}
+
 /// Returns the pseudo console, the write end of its input pipe, the read end
 /// of its output pipe, and the shell process attached to it.
 fn spawn_conpty_shell(
@@ -826,11 +913,27 @@ struct MasterState {
     pending_listener: Mutex<Option<RawHandle>>,
     terminating: AtomicBool,
     pty_closed: AtomicBool,
+    /// The shell's process id, whose children are the commands it runs.
+    shell_pid: u32,
+    /// The command the shell is running, as of the last look - see
+    /// [`running_command`]. Read on every piece of output, so it is not
+    /// looked up there.
+    foreground: Mutex<Option<u32>>,
+    notifications: Mutex<crate::relay::NotificationScanner>,
+    relay: Mutex<crate::relay::Relay>,
+    commands: Mutex<crate::relay::CommandWatch>,
+    quiet: Mutex<crate::relay::QuietWatch>,
+    last_line: Mutex<crate::relay::LastLines>,
+    /// Pieces of output written while a program held the terminal, which
+    /// tells whether it wrote anything after it was announced as quiet.
+    program_writes: AtomicU64,
+    quiet_announced: Mutex<crate::relay::QuietAnnounced>,
 }
 
 impl MasterState {
     fn add_client(&self, id: u64, channel: Arc<ClientChannel>, replay: bool) -> io::Result<()> {
         let mut history = self.history.lock().expect("history mutex poisoned");
+        channel.send(FRAME_OUTPUT, &crate::master_version_marker())?;
         if replay {
             for chunk in history.snapshot().chunks(REPLAY_CHUNK_SIZE) {
                 channel.send(FRAME_OUTPUT, chunk)?;
@@ -889,14 +992,114 @@ impl MasterState {
         if let Some(size) = apply {
             self.resize(size)?;
         }
+        self.commands
+            .lock()
+            .expect("commands mutex poisoned")
+            .typed(std::time::Instant::now());
+        self.quiet.lock().expect("quiet mutex poisoned").typed();
         self.write_input(data)
+    }
+
+    /// Looks at which command the shell is running and, as the Unix master
+    /// does with process groups, announces a long one that ended or a
+    /// program that went quiet, by writing the notification into the
+    /// session's output.
+    fn watch_command(&self) {
+        let running = running_command(self.shell_pid);
+        *self.foreground.lock().expect("foreground mutex poisoned") = running;
+        let shell = self.shell_pid as i32;
+        let foreground = running.map(|pid| pid as i32);
+        let now = std::time::Instant::now();
+        let finished = self
+            .commands
+            .lock()
+            .expect("commands mutex poisoned")
+            .observe(foreground, shell, now, command_name);
+        let writes = self.program_writes.load(Ordering::SeqCst);
+        let finished = finished.filter(|finished| {
+            !self
+                .quiet_announced
+                .lock()
+                .expect("quiet announced mutex poisoned")
+                .covers(finished.group, writes)
+        });
+        if let Some(mut finished) = finished {
+            finished.line = self
+                .last_line
+                .lock()
+                .expect("last line mutex poisoned")
+                .take(finished.group);
+            self.broadcast_output(&finished.sequence());
+        }
+        let quiet = self.quiet.lock().expect("quiet mutex poisoned").check(
+            foreground,
+            shell,
+            now,
+            command_name,
+        );
+        if let Some(mut quiet) = quiet {
+            quiet.line = self
+                .history
+                .lock()
+                .expect("history mutex poisoned")
+                .screen_line(crate::relay::Pick::Showing);
+            let asks = quiet
+                .line
+                .as_deref()
+                .is_some_and(crate::relay::asks_something);
+            if asks {
+                self.quiet_announced
+                    .lock()
+                    .expect("quiet announced mutex poisoned")
+                    .announced(quiet.group, writes);
+                self.broadcast_output(&quiet.sequence());
+            }
+        }
+    }
+
+    /// What the session's program wrote, as opposed to what the master adds
+    /// to the output itself.
+    fn program_output(&self, data: &[u8]) {
+        self.quiet
+            .lock()
+            .expect("quiet mutex poisoned")
+            .output(std::time::Instant::now());
+        self.broadcast_output(data);
+        let Some(pid) = *self.foreground.lock().expect("foreground mutex poisoned") else {
+            return;
+        };
+        self.program_writes.fetch_add(1, Ordering::SeqCst);
+        let line = self
+            .history
+            .lock()
+            .expect("history mutex poisoned")
+            .screen_line(crate::relay::Pick::Written);
+        if let Some(line) = line {
+            self.last_line
+                .lock()
+                .expect("last line mutex poisoned")
+                .wrote(pid as i32, line);
+        }
     }
 
     fn broadcast_output(&self, data: &[u8]) {
         let mut history = self.history.lock().expect("history mutex poisoned");
         history.push(data);
+        let found = self
+            .notifications
+            .lock()
+            .expect("notifications mutex poisoned")
+            .feed(data);
+        if !found.is_empty() {
+            self.quiet.lock().expect("quiet mutex poisoned").notified();
+        }
         let clients = self.clients.lock().expect("clients mutex poisoned");
         if clients.is_empty() {
+            let name = self.name.lock().expect("name mutex poisoned").clone();
+            let mut relay = self.relay.lock().expect("relay mutex poisoned");
+            for notice in &found {
+                relay.send(notice, &name);
+            }
             return;
         }
         let failed = clients
@@ -1183,11 +1386,21 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
         history.seed_restored(&restore.scrollback, restore.reboot_restored);
     }
 
+    let shell_pid = unsafe { GetProcessId(child.process) };
     let state = Arc::new(MasterState {
         name: Mutex::new(name.clone()),
         directory: Mutex::new(directory),
         created_at,
         child,
+        shell_pid,
+        foreground: Mutex::new(None),
+        notifications: Mutex::new(crate::relay::NotificationScanner::default()),
+        relay: Mutex::new(crate::relay::Relay::default()),
+        commands: Mutex::new(crate::relay::CommandWatch::default()),
+        quiet: Mutex::new(crate::relay::QuietWatch::default()),
+        last_line: Mutex::new(crate::relay::LastLines::default()),
+        program_writes: AtomicU64::new(0),
+        quiet_announced: Mutex::new(crate::relay::QuietAnnounced::default()),
         pseudo_console: Mutex::new(pseudo_console),
         pty_write: Mutex::new(pty_write),
         clients: Mutex::new(HashMap::new()),
@@ -1208,7 +1421,7 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
                 Ok(count) => {
                     let output = strip_resize_reports(&buffer[..count]);
                     if !output.is_empty() {
-                        reader_state.broadcast_output(&output);
+                        reader_state.program_output(&output);
                     }
                 }
                 Err(error) if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) => break,
@@ -1238,6 +1451,7 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
                 return;
             }
             tick += 1;
+            persistence_state.watch_command();
             // First tick included: see the same loop in `unix.rs`.
             if tick == 1 || tick.is_multiple_of(SCROLLBACK_FLUSH_EVERY_TICKS) {
                 persistence_state.flush_scrollback();

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.17.0 - 2026-11-14
+
+- A program that worked for 20 seconds or more and then stops while it still holds the terminal - an AI agent waiting for an answer, an installer asking to continue - announces it, with no setup and whichever program it is, unless you were typing into it. A log that just went still (`tail -f`, `docker compose up`) does not: the program has to read keys one by one, as interactive programs do, or show a question.
+- A command announced as stopped is not announced again when it ends without having written anything since.
+- The helper's own notifications say which kind they are and carry a version without the quoted line, so the app and the relay can follow the user's settings for each kind.
+- Notifications name the command, not its wrapper: `dnf update` for `sudo dnf update -y`, `deploy.sh prod` for a script, `gemini` for a tool run by node - never anything from the first option on, where passwords and tokens go.
+- A notification quotes the last line the command wrote (`Complete!`), or the question a stopped program is asking.
+- A long command that hands the terminal straight to the next one, as in `dnf update -y; reboot`, announces its end too.
+- macOS sessions name the command as well, from its arguments.
+- Windows sessions tell the app which version runs them, so the app no longer reports every Windows session as started with an older helper.
+- Windows sessions announce long commands and programs that went quiet, and pass a program's own notifications to the relay while no phone is attached, like the other systems.
+
 ## 0.16.0 - 2026-11-14
 
 - A running session moves to a newly installed version on its own, the next time nobody is attached: the shell and everything in it keep running, and the scrollback and resume position carry over.

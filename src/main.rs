@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{Arc, Mutex};
 
-#[cfg(unix)]
 mod relay;
 #[cfg(unix)]
 mod unix;
@@ -845,6 +844,23 @@ impl vt100::Callbacks for TitleTracker {
     }
 }
 
+/// Says which master serves the session, first thing on an attach: the
+/// app reads it to tell which features the session can have. Sent to the
+/// one client and never kept in the history - so it goes ahead of the
+/// replay and of the offset marker that ends it, where a client counting
+/// output positions has not started counting yet.
+pub(crate) fn master_version_marker() -> Vec<u8> {
+    format!(
+        "\x1b]5384;termphin-master;{}\x07",
+        env!("CARGO_PKG_VERSION")
+    )
+    .into_bytes()
+}
+
+/// Rows above the cursor [`History::screen_line`] looks through for the last
+/// line a command wrote.
+const WRITTEN_ROWS: u16 = 3;
+
 pub(crate) struct History {
     parser: vt100::Parser<TitleTracker>,
     title: Arc<Mutex<Option<Vec<u8>>>>,
@@ -919,6 +935,30 @@ impl History {
     #[cfg(unix)]
     pub(crate) fn output(&self) -> &OutputLog {
         &self.output
+    }
+
+    /// The line of the screen a notification quotes, as
+    /// [`relay::screen_line`] picks it. [`relay::Pick::Written`] looks at the
+    /// cursor's row and the few above it only, because it runs on every
+    /// piece of output a command writes.
+    pub(crate) fn screen_line(&self, pick: relay::Pick) -> Option<String> {
+        let screen = self.parser.screen();
+        let (_, cols) = screen.size();
+        let (cursor, _) = screen.cursor_position();
+        let rows = match pick {
+            relay::Pick::Written => {
+                let top = cursor.saturating_sub(WRITTEN_ROWS);
+                (top..=cursor)
+                    .map(|row| screen.contents_between(row, 0, row, cols))
+                    .collect::<Vec<_>>()
+            }
+            relay::Pick::Showing => screen.rows(0, cols).collect(),
+        };
+        let cursor = match pick {
+            relay::Pick::Written => rows.len() - 1,
+            relay::Pick::Showing => usize::from(cursor),
+        };
+        relay::screen_line(&rows, cursor, pick)
     }
 
     pub(crate) fn resize(&mut self, rows: u16, cols: u16) {
@@ -1009,6 +1049,14 @@ pub(crate) struct ClientQueue {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_master_names_its_version_in_a_private_sequence() {
+        let marker = String::from_utf8(super::master_version_marker()).unwrap();
+        assert!(marker.starts_with("\x1b]5384;termphin-master;"));
+        assert!(marker.ends_with('\x07'));
+        assert!(marker.contains(env!("CARGO_PKG_VERSION")));
+    }
+
     use super::*;
 
     #[test]
