@@ -571,6 +571,7 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
             last_line: Mutex::new(crate::relay::LastLines::default()),
             program_writes: AtomicU64::new(0),
             quiet_announced: Mutex::new(crate::relay::QuietAnnounced::default()),
+            watchers: Mutex::new(crate::relay::Watchers::default()),
             viewers: Mutex::new(Viewers::default()),
             shell_killed: AtomicBool::new(false),
             exiting: AtomicBool::new(false),
@@ -880,6 +881,9 @@ struct MasterState {
     /// tells whether it wrote anything after it was announced as quiet.
     program_writes: AtomicU64,
     quiet_announced: Mutex<crate::relay::QuietAnnounced>,
+    /// When the last phone left, so a stop it was there to see is not
+    /// announced once it has gone.
+    watchers: Mutex<crate::relay::Watchers>,
     viewers: Mutex<Viewers>,
     /// Separate from [`Self::exiting`] on purpose: sharing one flag meant an
     /// explicit `kill` marked the session wound down, and [`Self::finish`]
@@ -955,10 +959,16 @@ impl MasterState {
     }
 
     fn remove_client(&self, id: u64) {
-        self.clients
-            .lock()
-            .expect("clients mutex poisoned")
-            .remove(&id);
+        let nobody_left = {
+            let mut clients = self.clients.lock().expect("clients mutex poisoned");
+            clients.remove(&id).is_some() && clients.is_empty()
+        };
+        if nobody_left {
+            self.watchers
+                .lock()
+                .expect("watchers mutex poisoned")
+                .left(std::time::Instant::now());
+        }
         let back_to = self
             .viewers
             .lock()
@@ -1024,13 +1034,25 @@ impl MasterState {
                 std::time::Instant::now(),
                 command_name,
             );
+        let now = std::time::Instant::now();
         let writes = self.program_writes.load(Ordering::SeqCst);
+        let attached = !self
+            .clients
+            .lock()
+            .expect("clients mutex poisoned")
+            .is_empty();
+        let ended_at = now.checked_sub(crate::CWD_POLL_INTERVAL).unwrap_or(now);
         let finished = finished.filter(|finished| {
             !self
                 .quiet_announced
                 .lock()
                 .expect("quiet announced mutex poisoned")
                 .covers(finished.group, writes)
+                && !self
+                    .watchers
+                    .lock()
+                    .expect("watchers mutex poisoned")
+                    .saw(ended_at, attached)
         });
         if let Some(mut finished) = finished {
             finished.line = self
@@ -1056,7 +1078,12 @@ impl MasterState {
                 .line
                 .as_deref()
                 .is_some_and(crate::relay::asks_something);
-            if asks || terminal_waits_for_keys(self) {
+            let seen = self
+                .watchers
+                .lock()
+                .expect("watchers mutex poisoned")
+                .saw(quiet.stopped_at, attached);
+            if !seen && (asks || terminal_waits_for_keys(self)) {
                 self.quiet_announced
                     .lock()
                     .expect("quiet announced mutex poisoned")
@@ -1986,6 +2013,7 @@ pub(crate) fn resume_master(args: Vec<String>) -> io::Result<()> {
         last_line: Mutex::new(crate::relay::LastLines::default()),
         program_writes: AtomicU64::new(0),
         quiet_announced: Mutex::new(crate::relay::QuietAnnounced::default()),
+        watchers: Mutex::new(crate::relay::Watchers::default()),
         viewers: Mutex::new(Viewers::default()),
         shell_killed: AtomicBool::new(false),
         exiting: AtomicBool::new(false),

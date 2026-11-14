@@ -71,6 +71,8 @@ struct Busy {
 pub(crate) struct WentQuiet {
     /// The process group that went quiet.
     pub(crate) group: i32,
+    /// When its output stopped.
+    pub(crate) stopped_at: Instant,
     pub(crate) command: Option<String>,
     pub(crate) worked: Duration,
     /// What the screen shows, as [`screen_line`] picks it.
@@ -119,10 +121,12 @@ impl QuietWatch {
             return None;
         }
         let worked = busy.last_output.saturating_duration_since(busy.since);
+        let stopped_at = busy.last_output;
         self.busy = None;
         let command = foreground.filter(|&group| group > 0 && group != shell)?;
         (worked >= BUSY_FOR).then(|| WentQuiet {
             group: command,
+            stopped_at,
             command: name_of(command),
             worked,
             line: None,
@@ -146,6 +150,31 @@ impl WentQuiet {
             None => plain.clone(),
         };
         notice_sequence("quiet", &title, &body, &plain)
+    }
+}
+
+/// When the last phone left the session, which tells whether one was there
+/// to see a program stop.
+///
+/// A stop watched on screen is not news: someone who saw the output end and
+/// then put the phone away - the app going with it - would otherwise get a
+/// notification a few seconds later about what they just saw.
+#[derive(Default)]
+pub(crate) struct Watchers {
+    last_left: Option<Instant>,
+}
+
+impl Watchers {
+    /// The last phone attached to the session left at [at].
+    pub(crate) fn left(&mut self, at: Instant) {
+        self.last_left = Some(at);
+    }
+
+    /// Whether a stop at [stopped_at] was seen: no phone is attached now, but
+    /// one still was when it happened. With a phone attached the app decides
+    /// itself, since it knows whether the session is on screen.
+    pub(crate) fn saw(&self, stopped_at: Instant, attached: bool) -> bool {
+        !attached && self.last_left.is_some_and(|left| left >= stopped_at)
     }
 }
 
@@ -1084,6 +1113,7 @@ mod tests {
     fn the_scanner_reads_back_what_a_quiet_program_writes() {
         let quiet = WentQuiet {
             group: 42,
+            stopped_at: Instant::now(),
             command: None,
             worked: Duration::from_secs(42),
             line: None,
@@ -1303,6 +1333,7 @@ mod tests {
         );
         let quiet = WentQuiet {
             group: 42,
+            stopped_at: Instant::now(),
             command: Some("claude".to_owned()),
             worked: Duration::from_secs(185),
             line: Some("Allow edit; of cart.ts?".to_owned()),
@@ -1374,6 +1405,20 @@ mod tests {
         assert!(!announced.covers(42, 11), "it wrote more since");
         announced.announced(42, 10);
         assert!(!announced.covers(43, 10), "another program");
+    }
+
+    #[test]
+    fn a_stop_seen_before_the_phone_left_is_not_news() {
+        let start = Instant::now();
+        let mut watchers = Watchers::default();
+        assert!(!watchers.saw(start, false), "nobody was ever attached");
+        watchers.left(start + Duration::from_secs(3));
+        assert!(watchers.saw(start, false), "left after it stopped");
+        assert!(
+            !watchers.saw(start + Duration::from_secs(5), false),
+            "it stopped after the phone left"
+        );
+        assert!(!watchers.saw(start, true), "attached: the app decides");
     }
 
     #[test]
