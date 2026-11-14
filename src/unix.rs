@@ -834,9 +834,11 @@ fn file_identity(path: &Path) -> Option<(u64, u64)> {
     Some((metadata.dev(), metadata.ino()))
 }
 
-/// Says which master serves the session, right after an attach: the app
-/// reads it to tell which features the session can have. Sent to the one
-/// client and never kept in the history.
+/// Says which master serves the session, first thing on an attach: the
+/// app reads it to tell which features the session can have. Sent to the
+/// one client and never kept in the history - so it goes ahead of the
+/// replay and of the offset marker that ends it, where a client counting
+/// output positions has not started counting yet.
 fn master_version_marker() -> Vec<u8> {
     format!(
         "\x1b]5384;termphin-master;{}\x07",
@@ -857,6 +859,7 @@ impl MasterState {
         // snapshot. Queueing never blocks, so a slow client cannot hold the PTY
         // reader hostage.
         let mut history = self.history.lock().expect("history mutex poisoned");
+        channel.send(FRAME_OUTPUT, &master_version_marker())?;
         let missed = resume.and_then(|position| history.output().since(position));
         if let Some(missed) = missed {
             for chunk in missed.chunks(REPLAY_CHUNK_SIZE) {
@@ -871,7 +874,6 @@ impl MasterState {
             let position = history.output().position();
             channel.send(FRAME_REPLAY_DONE, &position.encode())?;
         }
-        channel.send(FRAME_OUTPUT, &master_version_marker())?;
         self.clients
             .lock()
             .expect("clients mutex poisoned")
