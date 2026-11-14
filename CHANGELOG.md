@@ -7,6 +7,7 @@
 - A notification quotes the last line the command wrote (`Complete!`), or the question a stopped program is asking.
 - A long command that hands the terminal straight to the next one, as in `dnf update -y; reboot`, announces its end too.
 - macOS sessions name the command as well, from its arguments.
+- Windows sessions tell the app which version runs them, so the app no longer reports every Windows session as started with an older helper.
 - Windows sessions announce long commands and programs that went quiet, and pass a program's own notifications to the relay while no phone is attached, like the other systems.
 
 ## 0.16.0 - 2026-11-14

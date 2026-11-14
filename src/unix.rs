@@ -903,19 +903,6 @@ fn file_identity(path: &Path) -> Option<(u64, u64)> {
     Some((metadata.dev(), metadata.ino()))
 }
 
-/// Says which master serves the session, first thing on an attach: the
-/// app reads it to tell which features the session can have. Sent to the
-/// one client and never kept in the history - so it goes ahead of the
-/// replay and of the offset marker that ends it, where a client counting
-/// output positions has not started counting yet.
-fn master_version_marker() -> Vec<u8> {
-    format!(
-        "\x1b]5384;termphin-master;{}\x07",
-        env!("CARGO_PKG_VERSION")
-    )
-    .into_bytes()
-}
-
 impl MasterState {
     fn add_client(
         &self,
@@ -928,7 +915,7 @@ impl MasterState {
         // snapshot. Queueing never blocks, so a slow client cannot hold the PTY
         // reader hostage.
         let mut history = self.history.lock().expect("history mutex poisoned");
-        channel.send(FRAME_OUTPUT, &master_version_marker())?;
+        channel.send(FRAME_OUTPUT, &crate::master_version_marker())?;
         let missed = resume.and_then(|position| history.output().since(position));
         if let Some(missed) = missed {
             for chunk in missed.chunks(REPLAY_CHUNK_SIZE) {
@@ -2068,14 +2055,6 @@ mod tests {
         let text = "format=999\nname=x\ncreated_at=1\nshell_pid=2\nepoch=3\ntotal=4\nrestored=0\n";
         assert_eq!(Handover::decode(text), None);
         assert_eq!(Handover::decode("name=x\n"), None);
-    }
-
-    #[test]
-    fn the_master_names_its_version_in_a_private_sequence() {
-        let marker = String::from_utf8(master_version_marker()).unwrap();
-        assert!(marker.starts_with("\x1b]5384;termphin-master;"));
-        assert!(marker.ends_with('\x07'));
-        assert!(marker.contains(env!("CARGO_PKG_VERSION")));
     }
 
     struct TempDir(PathBuf);

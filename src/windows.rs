@@ -929,6 +929,7 @@ struct MasterState {
 impl MasterState {
     fn add_client(&self, id: u64, channel: Arc<ClientChannel>, replay: bool) -> io::Result<()> {
         let mut history = self.history.lock().expect("history mutex poisoned");
+        channel.send(FRAME_OUTPUT, &crate::master_version_marker())?;
         if replay {
             for chunk in history.snapshot().chunks(REPLAY_CHUNK_SIZE) {
                 channel.send(FRAME_OUTPUT, chunk)?;

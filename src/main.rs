@@ -844,6 +844,19 @@ impl vt100::Callbacks for TitleTracker {
     }
 }
 
+/// Says which master serves the session, first thing on an attach: the
+/// app reads it to tell which features the session can have. Sent to the
+/// one client and never kept in the history - so it goes ahead of the
+/// replay and of the offset marker that ends it, where a client counting
+/// output positions has not started counting yet.
+pub(crate) fn master_version_marker() -> Vec<u8> {
+    format!(
+        "\x1b]5384;termphin-master;{}\x07",
+        env!("CARGO_PKG_VERSION")
+    )
+    .into_bytes()
+}
+
 /// Rows above the cursor [`History::screen_line`] looks through for the last
 /// line a command wrote.
 const WRITTEN_ROWS: u16 = 3;
@@ -1036,6 +1049,14 @@ pub(crate) struct ClientQueue {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_master_names_its_version_in_a_private_sequence() {
+        let marker = String::from_utf8(super::master_version_marker()).unwrap();
+        assert!(marker.starts_with("\x1b]5384;termphin-master;"));
+        assert!(marker.ends_with('\x07'));
+        assert!(marker.contains(env!("CARGO_PKG_VERSION")));
+    }
+
     use super::*;
 
     #[test]
