@@ -89,19 +89,79 @@ fn current_boot_id() -> Option<String> {
     (result == 0).then(|| boottime.tv_sec.to_string())
 }
 
-/// The name of the program leading process group [group], where the system
-/// says: `/proc/<pid>/comm` on Linux. macOS has no such file, and the
-/// notification then just says a command finished.
+/// How a notification names the command leading process group [group]:
+/// its command line through [`crate::relay::command_label`] where the system
+/// shows it (`/proc/<pid>/cmdline` on Linux), else `/proc/<pid>/comm`. macOS
+/// has neither, and the notification then just says a command finished.
 #[cfg(not(target_os = "macos"))]
 fn command_name(group: i32) -> Option<String> {
-    let name = fs::read_to_string(format!("/proc/{group}/comm")).ok()?;
-    let name = name.trim();
-    (!name.is_empty()).then(|| name.to_owned())
+    let line = fs::read(format!("/proc/{group}/cmdline")).unwrap_or_default();
+    let argv = line
+        .split(|&byte| byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect::<Vec<_>>();
+    crate::relay::command_label(&argv).or_else(|| {
+        let name = fs::read_to_string(format!("/proc/{group}/comm")).ok()?;
+        let name = name.trim();
+        (!name.is_empty()).then(|| name.to_owned())
+    })
 }
 
+/// How a notification names the command leading process group [group]:
+/// its arguments, as `sysctl(KERN_PROCARGS2)` reports them, through
+/// [`crate::relay::command_label`].
 #[cfg(target_os = "macos")]
-fn command_name(_group: i32) -> Option<String> {
-    None
+fn command_name(group: i32) -> Option<String> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, group];
+    let mut size: libc::size_t = 0;
+    let probed = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if probed != 0 || size == 0 {
+        return None;
+    }
+    let mut buffer = vec![0_u8; size];
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return None;
+    }
+    buffer.truncate(size);
+    crate::relay::command_label(&procargs_argv(&buffer)?)
+}
+
+/// The arguments in a `KERN_PROCARGS2` buffer: the argument count as a
+/// native `int`, the executable's path, NUL padding, then the arguments,
+/// each ending in a NUL, with the environment after them.
+#[cfg(any(test, target_os = "macos"))]
+fn procargs_argv(buffer: &[u8]) -> Option<Vec<String>> {
+    let count = usize::try_from(i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?)).ok()?;
+    let rest = buffer.get(4..)?;
+    let path_end = rest.iter().position(|&byte| byte == 0)?;
+    let rest = &rest[path_end..];
+    let start = rest.iter().position(|&byte| byte != 0)?;
+    let argv = rest[start..]
+        .split(|&byte| byte == 0)
+        .take(count)
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect::<Vec<_>>();
+    (argv.len() == count && count > 0).then_some(argv)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -496,6 +556,8 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
             notifications: Mutex::new(crate::relay::NotificationScanner::default()),
             relay: Mutex::new(crate::relay::Relay::default()),
             commands: Mutex::new(crate::relay::CommandWatch::default()),
+            quiet: Mutex::new(crate::relay::QuietWatch::default()),
+            last_line: Mutex::new(crate::relay::LastLines::default()),
             viewers: Mutex::new(Viewers::default()),
             shell_killed: AtomicBool::new(false),
             exiting: AtomicBool::new(false),
@@ -615,7 +677,7 @@ fn run_master(listener: UnixListener, mut pty_reader: File, state: Arc<MasterSta
         loop {
             match pty_reader.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(count) => reader_state.broadcast_output(&buffer[..count]),
+                Ok(count) => reader_state.program_output(&buffer[..count]),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
                 Err(_) => break,
@@ -794,6 +856,13 @@ struct MasterState {
     /// Notices a long command ending, so it can be announced like a
     /// notification the program sent itself.
     commands: Mutex<crate::relay::CommandWatch>,
+    /// Notices a program that worked for a while and then went quiet.
+    quiet: Mutex<crate::relay::QuietWatch>,
+    /// The last line each of the latest two commands wrote, with the
+    /// process group it ran as, for the notification its end sends: read as
+    /// it writes, since once it ends the shell's prompt - or the next
+    /// command - covers it.
+    last_line: Mutex<crate::relay::LastLines>,
     viewers: Mutex<Viewers>,
     /// Separate from [`Self::exiting`] on purpose: sharing one flag meant an
     /// explicit `kill` marked the session wound down, and [`Self::finish`]
@@ -930,6 +999,7 @@ impl MasterState {
             .lock()
             .expect("commands mutex poisoned")
             .typed(std::time::Instant::now());
+        self.quiet.lock().expect("quiet mutex poisoned").typed();
         self.write_input(data)
     }
 
@@ -950,8 +1020,53 @@ impl MasterState {
                 std::time::Instant::now(),
                 command_name,
             );
-        if let Some(finished) = finished {
+        if let Some(mut finished) = finished {
+            finished.line = self
+                .last_line
+                .lock()
+                .expect("last line mutex poisoned")
+                .take(finished.group);
             self.broadcast_output(&finished.sequence());
+        }
+        let quiet = self.quiet.lock().expect("quiet mutex poisoned").check(
+            (group > 0).then_some(group),
+            self.shell_pid,
+            std::time::Instant::now(),
+            command_name,
+        );
+        if let Some(mut quiet) = quiet {
+            quiet.line = self
+                .history
+                .lock()
+                .expect("history mutex poisoned")
+                .screen_line(crate::relay::Pick::Showing);
+            self.broadcast_output(&quiet.sequence());
+        }
+    }
+
+    /// What the session's program wrote, as opposed to what the master adds
+    /// to the output itself.
+    fn program_output(&self, data: &[u8]) {
+        self.quiet
+            .lock()
+            .expect("quiet mutex poisoned")
+            .output(std::time::Instant::now());
+        self.broadcast_output(data);
+        let fd = self.pty.lock().expect("pty mutex poisoned").as_raw_fd();
+        let group = unsafe { libc::tcgetpgrp(fd) };
+        if group <= 0 || group == self.shell_pid {
+            return;
+        }
+        let line = self
+            .history
+            .lock()
+            .expect("history mutex poisoned")
+            .screen_line(crate::relay::Pick::Written);
+        if let Some(line) = line {
+            self.last_line
+                .lock()
+                .expect("last line mutex poisoned")
+                .wrote(group, line);
         }
     }
 
@@ -963,6 +1078,9 @@ impl MasterState {
             .lock()
             .expect("notifications mutex poisoned")
             .feed(data);
+        if !found.is_empty() {
+            self.quiet.lock().expect("quiet mutex poisoned").notified();
+        }
         let clients = self.clients.lock().expect("clients mutex poisoned");
         if clients.is_empty() {
             let name = self.name.lock().expect("name mutex poisoned").clone();
@@ -1841,6 +1959,8 @@ pub(crate) fn resume_master(args: Vec<String>) -> io::Result<()> {
         notifications: Mutex::new(crate::relay::NotificationScanner::default()),
         relay: Mutex::new(crate::relay::Relay::default()),
         commands: Mutex::new(crate::relay::CommandWatch::default()),
+        quiet: Mutex::new(crate::relay::QuietWatch::default()),
+        last_line: Mutex::new(crate::relay::LastLines::default()),
         viewers: Mutex::new(Viewers::default()),
         shell_killed: AtomicBool::new(false),
         exiting: AtomicBool::new(false),
@@ -1862,6 +1982,24 @@ fn close_fd(fd: RawFd) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn macos_process_arguments_are_read_past_the_path_and_padding() {
+        let mut buffer = 3_i32.to_ne_bytes().to_vec();
+        buffer.extend(b"/usr/bin/sudo\0\0\0\0sudo\0dnf\0update\0HOME=/Users/a\0");
+        assert_eq!(
+            super::procargs_argv(&buffer),
+            Some(vec![
+                "sudo".to_owned(),
+                "dnf".to_owned(),
+                "update".to_owned()
+            ])
+        );
+        let mut short = 5_i32.to_ne_bytes().to_vec();
+        short.extend(b"/bin/x\0x\0");
+        assert_eq!(super::procargs_argv(&short), None);
+        assert_eq!(super::procargs_argv(b"\x01"), None);
+    }
+
     use super::*;
 
     /// Held by tests that fork and by those a forked child would upset: a
