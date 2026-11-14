@@ -69,6 +69,8 @@ struct Busy {
 /// had been working.
 #[derive(Debug, PartialEq)]
 pub(crate) struct WentQuiet {
+    /// The process group that went quiet.
+    pub(crate) group: i32,
     pub(crate) command: Option<String>,
     pub(crate) worked: Duration,
     /// What the screen shows, as [`screen_line`] picks it.
@@ -120,6 +122,7 @@ impl QuietWatch {
         self.busy = None;
         let command = foreground.filter(|&group| group > 0 && group != shell)?;
         (worked >= BUSY_FOR).then(|| WentQuiet {
+            group: command,
             command: name_of(command),
             worked,
             line: None,
@@ -128,21 +131,56 @@ impl QuietWatch {
 }
 
 impl WentQuiet {
-    /// The notification as an `OSC 777 ; notify` sequence, like
-    /// [`Finished::sequence`].
+    /// The notification, announced like [`Finished::sequence`].
     pub(crate) fn sequence(&self) -> Vec<u8> {
         let title = match &self.command {
-            Some(name) => format!("{} went quiet", field(name)),
+            Some(name) => format!("{name} went quiet"),
             None => "Session went quiet".to_owned(),
         };
+        let plain = format!(
+            "after {} of work - it may need you",
+            format_duration(self.worked)
+        );
         let body = match &self.line {
-            Some(line) => format!("{} · after {}", field(line), format_duration(self.worked)),
-            None => format!(
-                "after {} of work - it may need you",
-                format_duration(self.worked)
-            ),
+            Some(line) => format!("{line} · after {}", format_duration(self.worked)),
+            None => plain.clone(),
         };
-        format!("\x1b]777;notify;{title};{body}\x07").into_bytes()
+        notice_sequence("quiet", &title, &body, &plain)
+    }
+}
+
+/// Whether [line], what a program that stopped shows, asks for something:
+/// a question, a `[y/n]`, a `Password:`. With [`QuietWatch`] this tells a
+/// program waiting for an answer from a log that just went still - `tail -f`
+/// or `docker compose up` after the burst - where the terminal mode cannot.
+pub(crate) fn asks_something(line: &str) -> bool {
+    let lower = line.trim_end().to_lowercase();
+    lower.ends_with('?')
+        || lower.ends_with(':')
+        || ["[y/n]", "(y/n)", "[yes/no]", "(yes/no)", "[y/n]?"]
+            .iter()
+            .any(|choice| lower.contains(choice))
+}
+
+/// The program that went quiet and how much it had written by then, so a
+/// "finished" right after - with nothing written in between - is not
+/// announced as a second notification about the same stop.
+#[derive(Default)]
+pub(crate) struct QuietAnnounced {
+    last: Option<(i32, u64)>,
+}
+
+impl QuietAnnounced {
+    /// The program running as [group] was announced as quiet, having
+    /// written [writes] pieces of output.
+    pub(crate) fn announced(&mut self, group: i32, writes: u64) {
+        self.last = Some((group, writes));
+    }
+
+    /// Whether the end of [group], having written [writes] pieces, is the
+    /// stop already announced; forgets it either way.
+    pub(crate) fn covers(&mut self, group: i32, writes: u64) -> bool {
+        self.last.take() == Some((group, writes))
     }
 }
 
@@ -216,18 +254,19 @@ impl CommandWatch {
 }
 
 impl Finished {
-    /// The notification as `termphin notify` would write it, so the app and
-    /// the relay take it like any other: `OSC 777 ; notify ; title ; body`.
+    /// The notification, announced with [`notice_sequence`]: the app shows
+    /// it, and with nobody attached the scanner hands it to the relay.
     pub(crate) fn sequence(&self) -> Vec<u8> {
         let title = match &self.command {
-            Some(name) => format!("{} finished", field(name)),
+            Some(name) => format!("{name} finished"),
             None => "Command finished".to_owned(),
         };
+        let plain = format!("after {}", format_duration(self.duration));
         let body = match &self.line {
-            Some(line) => format!("{} · {}", field(line), format_duration(self.duration)),
-            None => format!("after {}", format_duration(self.duration)),
+            Some(line) => format!("{line} · {}", format_duration(self.duration)),
+            None => plain.clone(),
         };
-        format!("\x1b]777;notify;{title};{body}\x07").into_bytes()
+        notice_sequence("finished", &title, &body, &plain)
     }
 }
 
@@ -583,6 +622,32 @@ fn shorten(line: &str) -> String {
     format!("{}…", cut.trim_end())
 }
 
+/// A notification found in the output: one a program asked for, or one the
+/// master announced itself, which carries its [kind] and a [plain] body
+/// without the quoted line, for the relay to use when the user turned
+/// quoted lines off.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Notice {
+    pub(crate) kind: Option<String>,
+    pub(crate) title: String,
+    pub(crate) body: String,
+    pub(crate) plain: Option<String>,
+}
+
+/// The private sequence the master announces its own notifications with,
+/// `OSC 5385 ; termphin-notice ; kind ; title ; body ; plain`: a long command
+/// that `finished`, or a program that went `quiet`. Private so the app can
+/// tell them from what a program asked for, and honour a setting per kind.
+pub(crate) fn notice_sequence(kind: &str, title: &str, body: &str, plain: &str) -> Vec<u8> {
+    format!(
+        "\x1b]5385;termphin-notice;{kind};{};{};{}\x07",
+        field(title),
+        field(body),
+        field(plain)
+    )
+    .into_bytes()
+}
+
 /// Finds notification sequences in output that arrives in arbitrary pieces.
 #[derive(Default)]
 pub(crate) struct NotificationScanner {
@@ -602,7 +667,7 @@ enum ScanState {
 impl NotificationScanner {
     /// Feeds [data] and returns the notifications completed in it, as
     /// `(title, body)`.
-    pub(crate) fn feed(&mut self, data: &[u8]) -> Vec<(String, String)> {
+    pub(crate) fn feed(&mut self, data: &[u8]) -> Vec<Notice> {
         let mut found = Vec::new();
         for &byte in data {
             match self.state {
@@ -655,11 +720,27 @@ impl NotificationScanner {
 }
 
 /// The notification an OSC body asks for, if it is one.
-fn parse(body: &[u8]) -> Option<(String, String)> {
+fn parse(body: &[u8]) -> Option<Notice> {
     let text = String::from_utf8_lossy(body);
     let mut fields = text.splitn(2, ';');
     let code = fields.next()?;
     let rest = fields.next().unwrap_or("");
+    if code == "5385" {
+        let mut parts = rest.splitn(5, ';');
+        if parts.next()? != "termphin-notice" {
+            return None;
+        }
+        let kind = clean(parts.next()?);
+        let title = clean(parts.next().unwrap_or(""));
+        let body = clean(parts.next().unwrap_or(""));
+        let plain = clean(parts.next().unwrap_or(""));
+        return (!kind.is_empty() && !title.is_empty()).then_some(Notice {
+            kind: Some(kind),
+            title,
+            body,
+            plain: Some(plain),
+        });
+    }
     let (title, body) = match code {
         "9" => {
             if rest.is_empty() || rest.split(';').next()?.chars().all(|c| c.is_ascii_digit()) {
@@ -697,7 +778,12 @@ fn parse(body: &[u8]) -> Option<(String, String)> {
     };
     let title = clean(&title);
     let body = clean(&body);
-    (!title.is_empty() || !body.is_empty()).then_some((title, body))
+    (!title.is_empty() || !body.is_empty()).then_some(Notice {
+        kind: None,
+        title,
+        body,
+        plain: None,
+    })
 }
 
 fn clean(text: &str) -> String {
@@ -716,9 +802,11 @@ pub(crate) struct Relay {
 }
 
 impl Relay {
-    /// Sends [title] and [body] from the session called [session], which
-    /// the app opens when the notification is tapped.
-    pub(crate) fn send(&mut self, title: &str, body: &str, session: &str) {
+    /// Sends [notice] from the session called [session], which the app
+    /// opens when the notification is tapped. Its kind and plain body go
+    /// along, so the relay can honour the user's settings for the master's
+    /// own notifications.
+    pub(crate) fn send(&mut self, notice: &Notice, session: &str) {
         if self.last.is_some_and(|last| last.elapsed() < QUIET) {
             return;
         }
@@ -726,13 +814,20 @@ impl Relay {
             return;
         };
         self.last = Some(Instant::now());
-        let payload = format!(
-            "{{\"key\":{},\"title\":{},\"body\":{},\"session\":{}}}",
+        let mut payload = format!(
+            "{{\"key\":{},\"title\":{},\"body\":{},\"session\":{}",
             json_string(&key),
-            json_string(title),
-            json_string(body),
+            json_string(&notice.title),
+            json_string(&notice.body),
             json_string(session)
         );
+        if let Some(kind) = &notice.kind {
+            payload.push_str(&format!(",\"kind\":{}", json_string(kind)));
+        }
+        if let Some(plain) = &notice.plain {
+            payload.push_str(&format!(",\"plain\":{}", json_string(plain)));
+        }
+        payload.push('}');
         std::thread::spawn(move || {
             let mut curl = Command::new("curl");
             #[cfg(windows)]
@@ -793,6 +888,13 @@ pub(crate) fn json_string(text: &str) -> String {
 mod tests {
     use super::*;
 
+    fn pairs(found: Vec<Notice>) -> Vec<(String, String)> {
+        found
+            .into_iter()
+            .map(|notice| (notice.title, notice.body))
+            .collect()
+    }
+
     #[test]
     fn finds_each_dialect_across_chunks() {
         let mut scanner = NotificationScanner::default();
@@ -800,7 +902,7 @@ mod tests {
         found.extend(scanner.feed(b"ting\x07 more \x1b]777;notify;Build;done\x1b\\"));
         found.extend(scanner.feed(b"\x1b]99;i=1;Tests passed\x07"));
         assert_eq!(
-            found,
+            pairs(found),
             vec![
                 ("Claude is waiting".to_owned(), String::new()),
                 ("Build".to_owned(), "done".to_owned()),
@@ -829,7 +931,7 @@ mod tests {
         assert_eq!(done.command.as_deref(), Some("cargo"));
         assert_eq!(
             String::from_utf8(done.sequence()).unwrap(),
-            "\x1b]777;notify;cargo finished;after 1m 35s\x07"
+            "\x1b]5385;termphin-notice;finished;cargo finished;after 1m 35s;after 1m 35s\x07"
         );
         assert_eq!(watch.observe(Some(10), 10, later, name), None);
     }
@@ -882,7 +984,7 @@ mod tests {
         };
         let found = NotificationScanner::default().feed(&done.sequence());
         assert_eq!(
-            found,
+            pairs(found),
             vec![("make, rm finished".to_owned(), "after 1h 1m".to_owned())]
         );
     }
@@ -912,7 +1014,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             String::from_utf8(quiet.sequence()).unwrap(),
-            "\x1b]777;notify;claude went quiet;after 1m 35s of work - it may need you\x07"
+            "\x1b]5385;termphin-notice;quiet;claude went quiet;after 1m 35s of work - it may need you;after 1m 35s of work - it may need you\x07"
         );
         assert_eq!(
             watch.check(Some(42), 10, last + Duration::from_secs(30), name),
@@ -981,13 +1083,14 @@ mod tests {
     #[test]
     fn the_scanner_reads_back_what_a_quiet_program_writes() {
         let quiet = WentQuiet {
+            group: 42,
             command: None,
             worked: Duration::from_secs(42),
             line: None,
         };
         let found = NotificationScanner::default().feed(&quiet.sequence());
         assert_eq!(
-            found,
+            pairs(found),
             vec![(
                 "Session went quiet".to_owned(),
                 "after 42s of work - it may need you".to_owned()
@@ -1192,24 +1295,85 @@ mod tests {
             line: Some("Complete!".to_owned()),
         };
         assert_eq!(
-            NotificationScanner::default().feed(&done.sequence()),
+            pairs(NotificationScanner::default().feed(&done.sequence())),
             vec![(
                 "dnf update finished".to_owned(),
                 "Complete! · 4m 12s".to_owned()
             )]
         );
         let quiet = WentQuiet {
+            group: 42,
             command: Some("claude".to_owned()),
             worked: Duration::from_secs(185),
             line: Some("Allow edit; of cart.ts?".to_owned()),
         };
         assert_eq!(
-            NotificationScanner::default().feed(&quiet.sequence()),
+            pairs(NotificationScanner::default().feed(&quiet.sequence())),
             vec![(
                 "claude went quiet".to_owned(),
                 "Allow edit, of cart.ts? · after 3m 5s".to_owned()
             )]
         );
+    }
+
+    #[test]
+    fn the_masters_own_notices_carry_their_kind_and_plain_body() {
+        let done = Finished {
+            command: Some("dnf update".to_owned()),
+            duration: Duration::from_secs(252),
+            group: 42,
+            line: Some("Complete!".to_owned()),
+        };
+        assert_eq!(
+            NotificationScanner::default().feed(&done.sequence()),
+            vec![Notice {
+                kind: Some("finished".to_owned()),
+                title: "dnf update finished".to_owned(),
+                body: "Complete! · 4m 12s".to_owned(),
+                plain: Some("after 4m 12s".to_owned()),
+            }]
+        );
+        let found = NotificationScanner::default().feed(b"\x1b]9;Claude is waiting\x07");
+        assert_eq!(found[0].kind, None);
+        assert_eq!(found[0].plain, None);
+        assert!(
+            NotificationScanner::default()
+                .feed(b"\x1b]5385;something-else;finished;a;b;c\x07")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_question_or_prompt_asks_something_and_a_log_line_does_not() {
+        for line in [
+            "Do you want to make this edit to cart.ts?",
+            "Do you want to continue? [Y/n]",
+            "Overwrite file (y/n)",
+            "[sudo] password for alex:",
+            "Password:",
+        ] {
+            assert!(asks_something(line), "{line}");
+        }
+        for line in [
+            "api-1  | GET /health 200 3ms",
+            "Complete!",
+            "Downloading package 34/34",
+            "Tests passed",
+        ] {
+            assert!(!asks_something(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_finish_right_after_a_quiet_stop_is_the_same_news() {
+        let mut announced = QuietAnnounced::default();
+        announced.announced(42, 10);
+        assert!(announced.covers(42, 10));
+        assert!(!announced.covers(42, 10), "forgotten once asked");
+        announced.announced(42, 10);
+        assert!(!announced.covers(42, 11), "it wrote more since");
+        announced.announced(42, 10);
+        assert!(!announced.covers(43, 10), "another program");
     }
 
     #[test]

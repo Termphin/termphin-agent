@@ -924,6 +924,10 @@ struct MasterState {
     commands: Mutex<crate::relay::CommandWatch>,
     quiet: Mutex<crate::relay::QuietWatch>,
     last_line: Mutex<crate::relay::LastLines>,
+    /// Pieces of output written while a program held the terminal, which
+    /// tells whether it wrote anything after it was announced as quiet.
+    program_writes: AtomicU64,
+    quiet_announced: Mutex<crate::relay::QuietAnnounced>,
 }
 
 impl MasterState {
@@ -1011,6 +1015,14 @@ impl MasterState {
             .lock()
             .expect("commands mutex poisoned")
             .observe(foreground, shell, now, command_name);
+        let writes = self.program_writes.load(Ordering::SeqCst);
+        let finished = finished.filter(|finished| {
+            !self
+                .quiet_announced
+                .lock()
+                .expect("quiet announced mutex poisoned")
+                .covers(finished.group, writes)
+        });
         if let Some(mut finished) = finished {
             finished.line = self
                 .last_line
@@ -1031,7 +1043,17 @@ impl MasterState {
                 .lock()
                 .expect("history mutex poisoned")
                 .screen_line(crate::relay::Pick::Showing);
-            self.broadcast_output(&quiet.sequence());
+            let asks = quiet
+                .line
+                .as_deref()
+                .is_some_and(crate::relay::asks_something);
+            if asks {
+                self.quiet_announced
+                    .lock()
+                    .expect("quiet announced mutex poisoned")
+                    .announced(quiet.group, writes);
+                self.broadcast_output(&quiet.sequence());
+            }
         }
     }
 
@@ -1046,6 +1068,7 @@ impl MasterState {
         let Some(pid) = *self.foreground.lock().expect("foreground mutex poisoned") else {
             return;
         };
+        self.program_writes.fetch_add(1, Ordering::SeqCst);
         let line = self
             .history
             .lock()
@@ -1074,8 +1097,8 @@ impl MasterState {
         if clients.is_empty() {
             let name = self.name.lock().expect("name mutex poisoned").clone();
             let mut relay = self.relay.lock().expect("relay mutex poisoned");
-            for (title, body) in found {
-                relay.send(&title, &body, &name);
+            for notice in &found {
+                relay.send(notice, &name);
             }
             return;
         }
@@ -1376,6 +1399,8 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
         commands: Mutex::new(crate::relay::CommandWatch::default()),
         quiet: Mutex::new(crate::relay::QuietWatch::default()),
         last_line: Mutex::new(crate::relay::LastLines::default()),
+        program_writes: AtomicU64::new(0),
+        quiet_announced: Mutex::new(crate::relay::QuietAnnounced::default()),
         pseudo_console: Mutex::new(pseudo_console),
         pty_write: Mutex::new(pty_write),
         clients: Mutex::new(HashMap::new()),

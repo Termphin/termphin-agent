@@ -89,6 +89,17 @@ fn current_boot_id() -> Option<String> {
     (result == 0).then(|| boottime.tv_sec.to_string())
 }
 
+/// Whether the program holding the session's terminal reads keys one by
+/// one - canonical mode off, as an interactive program such as an AI agent
+/// sets it - rather than lines, which is what tells one waiting for its user
+/// from a log that just went still. The master end reports the terminal's
+/// settings on Linux and macOS alike.
+fn terminal_waits_for_keys(state: &MasterState) -> bool {
+    let fd = state.pty.lock().expect("pty mutex poisoned").as_raw_fd();
+    let mut settings = unsafe { std::mem::zeroed::<libc::termios>() };
+    (unsafe { libc::tcgetattr(fd, &mut settings) } == 0) && settings.c_lflag & libc::ICANON == 0
+}
+
 /// How a notification names the command leading process group [group]:
 /// its command line through [`crate::relay::command_label`] where the system
 /// shows it (`/proc/<pid>/cmdline` on Linux), else `/proc/<pid>/comm`. macOS
@@ -558,6 +569,8 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
             commands: Mutex::new(crate::relay::CommandWatch::default()),
             quiet: Mutex::new(crate::relay::QuietWatch::default()),
             last_line: Mutex::new(crate::relay::LastLines::default()),
+            program_writes: AtomicU64::new(0),
+            quiet_announced: Mutex::new(crate::relay::QuietAnnounced::default()),
             viewers: Mutex::new(Viewers::default()),
             shell_killed: AtomicBool::new(false),
             exiting: AtomicBool::new(false),
@@ -863,6 +876,10 @@ struct MasterState {
     /// it writes, since once it ends the shell's prompt - or the next
     /// command - covers it.
     last_line: Mutex<crate::relay::LastLines>,
+    /// Pieces of output written while a program held the terminal, which
+    /// tells whether it wrote anything after it was announced as quiet.
+    program_writes: AtomicU64,
+    quiet_announced: Mutex<crate::relay::QuietAnnounced>,
     viewers: Mutex<Viewers>,
     /// Separate from [`Self::exiting`] on purpose: sharing one flag meant an
     /// explicit `kill` marked the session wound down, and [`Self::finish`]
@@ -1007,6 +1024,14 @@ impl MasterState {
                 std::time::Instant::now(),
                 command_name,
             );
+        let writes = self.program_writes.load(Ordering::SeqCst);
+        let finished = finished.filter(|finished| {
+            !self
+                .quiet_announced
+                .lock()
+                .expect("quiet announced mutex poisoned")
+                .covers(finished.group, writes)
+        });
         if let Some(mut finished) = finished {
             finished.line = self
                 .last_line
@@ -1027,7 +1052,17 @@ impl MasterState {
                 .lock()
                 .expect("history mutex poisoned")
                 .screen_line(crate::relay::Pick::Showing);
-            self.broadcast_output(&quiet.sequence());
+            let asks = quiet
+                .line
+                .as_deref()
+                .is_some_and(crate::relay::asks_something);
+            if asks || terminal_waits_for_keys(self) {
+                self.quiet_announced
+                    .lock()
+                    .expect("quiet announced mutex poisoned")
+                    .announced(quiet.group, writes);
+                self.broadcast_output(&quiet.sequence());
+            }
         }
     }
 
@@ -1044,6 +1079,7 @@ impl MasterState {
         if group <= 0 || group == self.shell_pid {
             return;
         }
+        self.program_writes.fetch_add(1, Ordering::SeqCst);
         let line = self
             .history
             .lock()
@@ -1072,8 +1108,8 @@ impl MasterState {
         if clients.is_empty() {
             let name = self.name.lock().expect("name mutex poisoned").clone();
             let mut relay = self.relay.lock().expect("relay mutex poisoned");
-            for (title, body) in found {
-                relay.send(&title, &body, &name);
+            for notice in &found {
+                relay.send(notice, &name);
             }
             return;
         }
@@ -1948,6 +1984,8 @@ pub(crate) fn resume_master(args: Vec<String>) -> io::Result<()> {
         commands: Mutex::new(crate::relay::CommandWatch::default()),
         quiet: Mutex::new(crate::relay::QuietWatch::default()),
         last_line: Mutex::new(crate::relay::LastLines::default()),
+        program_writes: AtomicU64::new(0),
+        quiet_announced: Mutex::new(crate::relay::QuietAnnounced::default()),
         viewers: Mutex::new(Viewers::default()),
         shell_killed: AtomicBool::new(false),
         exiting: AtomicBool::new(false),
