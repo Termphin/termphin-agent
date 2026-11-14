@@ -1864,8 +1864,14 @@ fn close_fd(fd: RawFd) {
 mod tests {
     use super::*;
 
+    /// Held by tests that fork and by those a forked child would upset: a
+    /// fork copies every open fd, a socket another test just bound
+    /// included, and that socket then reads as alive.
+    static FORK_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn a_lost_handover_still_finds_the_shell_from_the_terminal() {
+        let _fork = FORK_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let size = unsafe { std::mem::zeroed::<libc::winsize>() };
         let mut master_fd = -1;
         let mut slave_fd = -1;
@@ -1963,6 +1969,7 @@ mod tests {
 
     #[test]
     fn a_socket_nobody_is_listening_on_reads_as_absent() {
+        let _fork = FORK_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = TempDir::new("absent");
         assert!(matches!(
             probe_socket(&dir.0.join("control.sock")),
