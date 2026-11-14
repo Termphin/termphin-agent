@@ -3,7 +3,8 @@
 ## Unreleased
 
 - `termphin notify [title] [body]` shows a notification in Termphin, for the end of a long command or as a Claude Code hook.
-- A notification a program asks for while no phone is attached goes out through Termphin's relay, once the app has set the server up for push.
+- A notification a program asks for while no phone is attached goes out through Termphin's relay, once the app has set the server up for push. It names the session, so tapping it opens that session.
+- A command that runs for 30 seconds or more announces its end, in any shell and with no setup, unless you were typing into it.
 
 ## 0.14.0 - 2026-11-13
 

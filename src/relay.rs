@@ -22,6 +22,100 @@ const MAX_OSC: usize = 1024;
 /// Shortest gap between two relayed notifications from one session.
 const QUIET: Duration = Duration::from_secs(3);
 
+/// How long a command has to run before its end is worth a notification.
+const LONG_COMMAND: Duration = Duration::from_secs(30);
+
+/// A command typed into this recently was being watched, not waited for:
+/// `vim` or a REPL ending is no news.
+const TYPED_RECENTLY: Duration = Duration::from_secs(15);
+
+/// Notices a long command coming to an end, without any help from the
+/// shell: the master polls which process group has the terminal, and a
+/// command is whatever holds it other than the shell.
+#[derive(Default)]
+pub(crate) struct CommandWatch {
+    running: Option<(i32, Instant, Option<String>)>,
+    last_input: Option<Instant>,
+}
+
+/// A long command that ended: its name, if the system says, and how long it
+/// ran.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Finished {
+    pub(crate) command: Option<String>,
+    pub(crate) duration: Duration,
+}
+
+impl CommandWatch {
+    /// Someone typed into the session.
+    pub(crate) fn typed(&mut self, now: Instant) {
+        self.last_input = Some(now);
+    }
+
+    /// Takes the group holding the terminal at [now]; [name_of] names a
+    /// group when it starts. Returns the command that just ended, if it ran
+    /// long and unattended.
+    pub(crate) fn observe(
+        &mut self,
+        foreground: Option<i32>,
+        shell: i32,
+        now: Instant,
+        name_of: impl Fn(i32) -> Option<String>,
+    ) -> Option<Finished> {
+        let command = foreground.filter(|&group| group > 0 && group != shell);
+        match (command, &self.running) {
+            (Some(group), Some((running, _, _))) if group == *running => None,
+            (Some(group), _) => {
+                self.running = Some((group, now, name_of(group)));
+                None
+            }
+            (None, None) => None,
+            (None, Some(_)) => {
+                let (_, started, name) = self.running.take()?;
+                let duration = now.saturating_duration_since(started);
+                let watched = self
+                    .last_input
+                    .is_some_and(|typed| now.saturating_duration_since(typed) < TYPED_RECENTLY);
+                (duration >= LONG_COMMAND && !watched).then_some(Finished {
+                    command: name,
+                    duration,
+                })
+            }
+        }
+    }
+}
+
+impl Finished {
+    /// The notification as `termphin notify` would write it, so the app and
+    /// the relay take it like any other: `OSC 777 ; notify ; title ; body`.
+    pub(crate) fn sequence(&self) -> Vec<u8> {
+        let title = match &self.command {
+            Some(name) => format!("{} finished", field(name)),
+            None => "Command finished".to_owned(),
+        };
+        format!(
+            "\x1b]777;notify;{};after {}\x07",
+            title,
+            format_duration(self.duration)
+        )
+        .into_bytes()
+    }
+}
+
+/// [text] made safe to stand as one field of an OSC sequence.
+fn field(text: &str) -> String {
+    clean(text).replace(';', ",")
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match (seconds / 3600, seconds % 3600 / 60, seconds % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m {s}s"),
+        (h, m, _) => format!("{h}h {m}m"),
+    }
+}
+
 /// Finds notification sequences in output that arrives in arbitrary pieces.
 #[derive(Default)]
 pub(crate) struct NotificationScanner {
@@ -155,7 +249,9 @@ pub(crate) struct Relay {
 }
 
 impl Relay {
-    pub(crate) fn send(&mut self, title: &str, body: &str) {
+    /// Sends [title] and [body] from the session called [session], which
+    /// the app opens when the notification is tapped.
+    pub(crate) fn send(&mut self, title: &str, body: &str, session: &str) {
         if self.last.is_some_and(|last| last.elapsed() < QUIET) {
             return;
         }
@@ -164,10 +260,11 @@ impl Relay {
         };
         self.last = Some(Instant::now());
         let payload = format!(
-            "{{\"key\":{},\"title\":{},\"body\":{}}}",
+            "{{\"key\":{},\"title\":{},\"body\":{},\"session\":{}}}",
             json_string(&key),
             json_string(title),
-            json_string(body)
+            json_string(body),
+            json_string(session)
         );
         std::thread::spawn(move || {
             let child = Command::new("curl")
@@ -239,6 +336,57 @@ mod tests {
         let mut scanner = NotificationScanner::default();
         let found = scanner.feed(b"\x1b]0;title\x07\x1b]9;4;1;50\x07\x1b]52;c;aGk=\x07\x1b[31mred");
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn a_long_unattended_command_is_announced_once_it_ends() {
+        let start = Instant::now();
+        let mut watch = CommandWatch::default();
+        let name = |_| Some("cargo".to_owned());
+        assert_eq!(watch.observe(Some(10), 10, start, name), None);
+        assert_eq!(watch.observe(Some(42), 10, start, name), None);
+        let later = start + Duration::from_secs(95);
+        assert_eq!(watch.observe(Some(42), 10, later, name), None);
+        let done = watch.observe(Some(10), 10, later, name).unwrap();
+        assert_eq!(done.command.as_deref(), Some("cargo"));
+        assert_eq!(
+            String::from_utf8(done.sequence()).unwrap(),
+            "\x1b]777;notify;cargo finished;after 1m 35s\x07"
+        );
+        assert_eq!(watch.observe(Some(10), 10, later, name), None);
+    }
+
+    #[test]
+    fn short_or_watched_commands_are_not() {
+        let start = Instant::now();
+        let name = |_| None;
+        let mut watch = CommandWatch::default();
+        watch.observe(Some(42), 10, start, name);
+        assert_eq!(
+            watch.observe(Some(10), 10, start + Duration::from_secs(5), name),
+            None
+        );
+
+        let mut watch = CommandWatch::default();
+        watch.observe(Some(42), 10, start, name);
+        watch.typed(start + Duration::from_secs(55));
+        assert_eq!(
+            watch.observe(Some(10), 10, start + Duration::from_secs(60), name),
+            None
+        );
+    }
+
+    #[test]
+    fn the_scanner_reads_back_what_a_finished_command_writes() {
+        let done = Finished {
+            command: Some("make; rm".to_owned()),
+            duration: Duration::from_secs(3700),
+        };
+        let found = NotificationScanner::default().feed(&done.sequence());
+        assert_eq!(
+            found,
+            vec![("make, rm finished".to_owned(), "after 1h 1m".to_owned())]
+        );
     }
 
     #[test]
