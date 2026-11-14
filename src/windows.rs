@@ -928,6 +928,9 @@ struct MasterState {
     /// tells whether it wrote anything after it was announced as quiet.
     program_writes: AtomicU64,
     quiet_announced: Mutex<crate::relay::QuietAnnounced>,
+    /// When the last phone left, so a stop it was there to see is not
+    /// announced once it has gone.
+    watchers: Mutex<crate::relay::Watchers>,
 }
 
 impl MasterState {
@@ -948,10 +951,16 @@ impl MasterState {
     }
 
     fn remove_client(&self, id: u64) {
-        self.clients
-            .lock()
-            .expect("clients mutex poisoned")
-            .remove(&id);
+        let nobody_left = {
+            let mut clients = self.clients.lock().expect("clients mutex poisoned");
+            clients.remove(&id).is_some() && clients.is_empty()
+        };
+        if nobody_left {
+            self.watchers
+                .lock()
+                .expect("watchers mutex poisoned")
+                .left(std::time::Instant::now());
+        }
         let back_to = self
             .viewers
             .lock()
@@ -1016,12 +1025,23 @@ impl MasterState {
             .expect("commands mutex poisoned")
             .observe(foreground, shell, now, command_name);
         let writes = self.program_writes.load(Ordering::SeqCst);
+        let attached = !self
+            .clients
+            .lock()
+            .expect("clients mutex poisoned")
+            .is_empty();
+        let ended_at = now.checked_sub(crate::CWD_POLL_INTERVAL).unwrap_or(now);
         let finished = finished.filter(|finished| {
             !self
                 .quiet_announced
                 .lock()
                 .expect("quiet announced mutex poisoned")
                 .covers(finished.group, writes)
+                && !self
+                    .watchers
+                    .lock()
+                    .expect("watchers mutex poisoned")
+                    .saw(ended_at, attached)
         });
         if let Some(mut finished) = finished {
             finished.line = self
@@ -1047,7 +1067,12 @@ impl MasterState {
                 .line
                 .as_deref()
                 .is_some_and(crate::relay::asks_something);
-            if asks {
+            let seen = self
+                .watchers
+                .lock()
+                .expect("watchers mutex poisoned")
+                .saw(quiet.stopped_at, attached);
+            if asks && !seen {
                 self.quiet_announced
                     .lock()
                     .expect("quiet announced mutex poisoned")
@@ -1401,6 +1426,7 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
         last_line: Mutex::new(crate::relay::LastLines::default()),
         program_writes: AtomicU64::new(0),
         quiet_announced: Mutex::new(crate::relay::QuietAnnounced::default()),
+        watchers: Mutex::new(crate::relay::Watchers::default()),
         pseudo_console: Mutex::new(pseudo_console),
         pty_write: Mutex::new(pty_write),
         clients: Mutex::new(HashMap::new()),
