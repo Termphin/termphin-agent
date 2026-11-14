@@ -267,8 +267,32 @@ const WRAPPERS: [(&str, &[&str]); 9] = [
 /// Interpreters whose program is the script they run, named in its place -
 /// shells among them, since a script started as `./deploy.sh` runs as
 /// `bash ./deploy.sh`.
-const INTERPRETERS: [&str; 12] = [
-    "node", "bun", "deno", "python", "python3", "ruby", "perl", "bash", "sh", "zsh", "dash", "fish",
+const INTERPRETERS: [&str; 14] = [
+    "node",
+    "bun",
+    "deno",
+    "python",
+    "python3",
+    "ruby",
+    "perl",
+    "bash",
+    "sh",
+    "zsh",
+    "dash",
+    "fish",
+    "powershell",
+    "pwsh",
+];
+
+/// Interpreter options whose value comes as the next argument, which is
+/// then not the script: PowerShell's, mostly.
+const INTERPRETER_VALUES: [&str; 6] = [
+    "-executionpolicy",
+    "-windowstyle",
+    "-outputformat",
+    "-inputformat",
+    "-version",
+    "-configurationname",
 ];
 
 /// Most words a command is named by.
@@ -336,7 +360,16 @@ pub(crate) fn command_label(argv: &[String]) -> Option<String> {
         let script = loop {
             match words.peek().copied() {
                 None => break None,
-                Some("-c" | "-e") => break None,
+                Some(word)
+                    if ["-c", "-e", "-command", "-encodedcommand"]
+                        .contains(&word.to_ascii_lowercase().as_str()) =>
+                {
+                    break None;
+                }
+                Some(word) if INTERPRETER_VALUES.contains(&word.to_ascii_lowercase().as_str()) => {
+                    words.next();
+                    words.next();
+                }
                 Some("-m") => {
                     words.next();
                     break words.next();
