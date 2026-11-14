@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.16.0 - 2026-11-14
+
+- A running session moves to a newly installed version on its own, the next time nobody is attached: the shell and everything in it keep running, and the scrollback and resume position carry over.
+- A session tells the app which version runs it, so the app can say what an older session is missing.
+
 ## 0.15.0 - 2026-11-14
 
 - `termphin notify [title] [body]` shows a notification in Termphin, for the end of a long command or as a Claude Code hook.

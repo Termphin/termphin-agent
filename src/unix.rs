@@ -5,7 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -499,6 +499,9 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
             viewers: Mutex::new(Viewers::default()),
             shell_killed: AtomicBool::new(false),
             exiting: AtomicBool::new(false),
+            listener_fd: listener.as_raw_fd(),
+            binary: Binary::current(),
+            upgrade_considered: Mutex::new(None),
         });
         spawn_persistence_thread(Arc::clone(&state));
         Ok((listener, reader, state))
@@ -797,6 +800,51 @@ struct MasterState {
     /// then skipped both the exit frame and the drain of the last output.
     shell_killed: AtomicBool,
     exiting: AtomicBool,
+    /// The control socket, kept by fd so an upgrade can hand it to the
+    /// binary it execs.
+    listener_fd: RawFd,
+    /// The binary this master runs, as it was on disk when it started, so a
+    /// newer one installed over it is noticed.
+    binary: Option<Binary>,
+    /// The installed binary last considered for an upgrade, so one that
+    /// cannot take the session over is not asked again every tick.
+    upgrade_considered: Mutex<Option<(u64, u64)>>,
+}
+
+/// A binary on disk, by path and by the file it was when looked at.
+#[derive(Clone)]
+struct Binary {
+    path: PathBuf,
+    identity: (u64, u64),
+}
+
+impl Binary {
+    /// The executable this process runs, while it is still what the path
+    /// names.
+    fn current() -> Option<Self> {
+        let path = env::current_exe().ok()?;
+        let identity = file_identity(&path)?;
+        Some(Self { path, identity })
+    }
+}
+
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+/// Says which master serves the session, first thing on an attach: the
+/// app reads it to tell which features the session can have. Sent to the
+/// one client and never kept in the history - so it goes ahead of the
+/// replay and of the offset marker that ends it, where a client counting
+/// output positions has not started counting yet.
+fn master_version_marker() -> Vec<u8> {
+    format!(
+        "\x1b]5384;termphin-master;{}\x07",
+        env!("CARGO_PKG_VERSION")
+    )
+    .into_bytes()
 }
 
 impl MasterState {
@@ -811,6 +859,7 @@ impl MasterState {
         // snapshot. Queueing never blocks, so a slow client cannot hold the PTY
         // reader hostage.
         let mut history = self.history.lock().expect("history mutex poisoned");
+        channel.send(FRAME_OUTPUT, &master_version_marker())?;
         let missed = resume.and_then(|position| history.output().since(position));
         if let Some(missed) = missed {
             for chunk in missed.chunks(REPLAY_CHUNK_SIZE) {
@@ -1047,6 +1096,109 @@ impl MasterState {
                 let _ = fs::write(directory.join("scrollback"), snapshot);
             }
         }
+    }
+
+    /// Takes a newer binary installed over this one into use, in place:
+    /// the master execs it, handing over the terminal, the control socket
+    /// and what the history and output log hold, and the shell - its child
+    /// either way - runs on as if nothing happened.
+    ///
+    /// Only while nobody is attached, so no one is cut off, and only to a
+    /// later version that says it can take a session over. One that cannot
+    /// is noted and left alone until something else is installed.
+    fn upgrade_if_installed(&self) {
+        let Some(binary) = &self.binary else {
+            return;
+        };
+        let Some(installed) = file_identity(&binary.path) else {
+            return;
+        };
+        if installed == binary.identity {
+            return;
+        }
+        {
+            let mut considered = self
+                .upgrade_considered
+                .lock()
+                .expect("upgrade mutex poisoned");
+            if *considered == Some(installed) {
+                return;
+            }
+            *considered = Some(installed);
+        }
+        if !self
+            .clients
+            .lock()
+            .expect("clients mutex poisoned")
+            .is_empty()
+        {
+            *self
+                .upgrade_considered
+                .lock()
+                .expect("upgrade mutex poisoned") = None;
+            return;
+        }
+        if !can_take_over(&binary.path) {
+            return;
+        }
+        let _ = self.exec_into(&binary.path);
+    }
+
+    /// Writes the handover and execs [path]. Returns only if that failed,
+    /// with the session left as it was.
+    fn exec_into(&self, path: &Path) -> io::Result<()> {
+        let clients = self.clients.lock().expect("clients mutex poisoned");
+        if !clients.is_empty() {
+            return Ok(());
+        }
+        let history = self.history.lock().expect("history mutex poisoned");
+        let pty_fd = self.pty.lock().expect("pty mutex poisoned").as_raw_fd();
+        let name = self.name.lock().expect("name mutex poisoned").clone();
+        let directory = self
+            .directory
+            .lock()
+            .expect("directory mutex poisoned")
+            .clone();
+        let (epoch, total, output) = history.output().parts();
+        let handover = Handover {
+            name: name.clone(),
+            created_at: self.created_at,
+            shell_pid: self.shell_pid,
+            epoch,
+            total,
+            restored: history.restored(),
+        };
+        let mut screen_history = history;
+        let screen = screen_history.snapshot();
+        write_private(&directory.join(HANDOVER_FILE), handover.encode().as_bytes())?;
+        write_private(&directory.join(HANDOVER_SCREEN_FILE), &screen)?;
+        write_private(&directory.join(HANDOVER_OUTPUT_FILE), &output)?;
+
+        let path_c = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| invalid_input("binary path has a NUL byte"))?;
+        let args = [
+            CString::new("termphin-agent").expect("static string"),
+            CString::new("__master-resume").expect("static string"),
+            CString::new(name).map_err(|_| invalid_input("name has a NUL byte"))?,
+            CString::new(pty_fd.to_string()).expect("digits"),
+            CString::new(self.listener_fd.to_string()).expect("digits"),
+        ];
+        let mut argv = args.iter().map(|arg| arg.as_ptr()).collect::<Vec<_>>();
+        argv.push(std::ptr::null());
+        set_cloexec(pty_fd, false);
+        set_cloexec(self.listener_fd, false);
+        unsafe {
+            libc::execv(path_c.as_ptr(), argv.as_ptr());
+        }
+        let error = io::Error::last_os_error();
+        set_cloexec(pty_fd, true);
+        set_cloexec(self.listener_fd, true);
+        for file in [HANDOVER_FILE, HANDOVER_SCREEN_FILE, HANDOVER_OUTPUT_FILE] {
+            let _ = fs::remove_file(directory.join(file));
+        }
+        drop(screen_history);
+        drop(clients);
+        Err(error)
     }
 
     fn finish(&self) -> ! {
@@ -1483,6 +1635,7 @@ fn spawn_persistence_thread(state: Arc<MasterState>) {
             thread::sleep(CWD_POLL_INTERVAL);
             tick += 1;
             state.watch_command();
+            state.upgrade_if_installed();
             // The first tick flushes too: a session that dies before the
             // first full interval - a power cut minutes in is rare, seconds
             // in is not - would otherwise have no scrollback on disk at all.
@@ -1492,6 +1645,211 @@ fn spawn_persistence_thread(state: Arc<MasterState>) {
             );
         }
     });
+}
+
+const HANDOVER_FILE: &str = "handover";
+const HANDOVER_SCREEN_FILE: &str = "handover.screen";
+const HANDOVER_OUTPUT_FILE: &str = "handover.output";
+
+/// What a master passes on to the binary it execs, besides the screen and
+/// the output log, which go in files of their own.
+#[derive(Debug, PartialEq)]
+struct Handover {
+    name: String,
+    created_at: u64,
+    shell_pid: libc::pid_t,
+    epoch: u64,
+    total: u64,
+    restored: bool,
+}
+
+impl Handover {
+    fn encode(&self) -> String {
+        format!(
+            "format={}\nname={}\ncreated_at={}\nshell_pid={}\nepoch={}\ntotal={}\nrestored={}\n",
+            crate::RESUME_FORMAT,
+            self.name,
+            self.created_at,
+            self.shell_pid,
+            self.epoch,
+            self.total,
+            u8::from(self.restored)
+        )
+    }
+
+    fn decode(text: &str) -> Option<Self> {
+        let field = |key: &str| {
+            text.lines()
+                .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+        };
+        if field("format")?.parse::<u32>().ok()? != crate::RESUME_FORMAT {
+            return None;
+        }
+        Some(Self {
+            name: field("name")?.to_owned(),
+            created_at: field("created_at")?.parse().ok()?,
+            shell_pid: field("shell_pid")?.parse().ok()?,
+            epoch: field("epoch")?.parse().ok()?,
+            total: field("total")?.parse().ok()?,
+            restored: field("restored")? == "1",
+        })
+    }
+}
+
+fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(data)?;
+    file.sync_all()
+}
+
+fn set_cloexec(fd: RawFd, on: bool) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            let flags = if on {
+                flags | libc::FD_CLOEXEC
+            } else {
+                flags & !libc::FD_CLOEXEC
+            };
+            libc::fcntl(fd, libc::F_SETFD, flags);
+        }
+    }
+}
+
+/// Whether the binary at [path] is a later version than this one and can
+/// take a running session over.
+fn can_take_over(path: &Path) -> bool {
+    let run = |arg: &str| {
+        process::Command::new(path)
+            .arg(arg)
+            .stdin(process::Stdio::null())
+            .stderr(process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let Some(version) = run("version") else {
+        return false;
+    };
+    let Some(version) = version.split_whitespace().nth(1) else {
+        return false;
+    };
+    crate::newer_version(version, env!("CARGO_PKG_VERSION"))
+        && run("__resume-capable").as_deref() == Some(&crate::RESUME_FORMAT.to_string())
+}
+
+/// What to go on when the handover cannot be read - removed, cut short by
+/// a full disk, from a format this binary does not know. The terminal and
+/// the shell are still here, which is what matters: the shell is the
+/// session leader of the terminal, so it is found from the terminal
+/// itself, and the session carries on with only its scrollback lost.
+fn lost_handover(name: &str, pty_fd: RawFd, directory: &Path) -> Handover {
+    let shell_pid = unsafe { libc::tcgetsid(pty_fd) };
+    let created_at = fs::read_to_string(directory.join("created_at"))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        });
+    Handover {
+        name: name.to_owned(),
+        created_at,
+        shell_pid,
+        epoch: 0,
+        total: 0,
+        restored: false,
+    }
+}
+
+/// The other half of [`MasterState::exec_into`]: the master as the newer
+/// binary, picking up the session from the handover. `args` are the
+/// session's name and the fds of its terminal and control socket.
+///
+/// It never gives up on the session once it has the terminal: exiting here
+/// would close the terminal and hang up the shell and everything running
+/// in it. A handover it cannot read costs the scrollback, nothing more.
+pub(crate) fn resume_master(args: Vec<String>) -> io::Result<()> {
+    let [name, pty_fd, listener_fd] = args.as_slice() else {
+        return Err(invalid_input(
+            "usage: __master-resume <name> <pty> <listener>",
+        ));
+    };
+    let pty_fd: RawFd = pty_fd.parse().map_err(|_| invalid_input("bad pty fd"))?;
+    let listener_fd: RawFd = listener_fd
+        .parse()
+        .map_err(|_| invalid_input("bad listener fd"))?;
+    set_cloexec(pty_fd, true);
+    set_cloexec(listener_fd, true);
+    unsafe {
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+    let _ = install_master_sigterm_handler();
+
+    let directory = session_dir(name)?;
+    let handover = fs::read_to_string(directory.join(HANDOVER_FILE))
+        .ok()
+        .and_then(|text| Handover::decode(&text));
+    let screen = fs::read(directory.join(HANDOVER_SCREEN_FILE)).unwrap_or_default();
+    let output = fs::read(directory.join(HANDOVER_OUTPUT_FILE)).unwrap_or_default();
+    for file in [HANDOVER_FILE, HANDOVER_SCREEN_FILE, HANDOVER_OUTPUT_FILE] {
+        let _ = fs::remove_file(directory.join(file));
+    }
+
+    let reader = unsafe { File::from_raw_fd(pty_fd) };
+    let writer = reader.try_clone()?;
+    let listener = unsafe { UnixListener::from_raw_fd(listener_fd) };
+    let mut size = unsafe { std::mem::zeroed::<libc::winsize>() };
+    unsafe {
+        libc::ioctl(pty_fd, libc::TIOCGWINSZ as _, &mut size);
+    }
+    let handover = handover.unwrap_or_else(|| lost_handover(name, pty_fd, &directory));
+    let output_log = if handover.total > 0 || !output.is_empty() {
+        crate::OutputLog::from_parts(
+            handover.epoch,
+            handover.total,
+            &output,
+            crate::OUTPUT_LOG_BYTES,
+        )
+    } else {
+        crate::OutputLog::new(crate::OUTPUT_LOG_BYTES)
+    };
+    let history = History::resumed(
+        size.ws_row,
+        size.ws_col,
+        &screen,
+        output_log,
+        handover.restored,
+    );
+    let state = Arc::new(MasterState {
+        name: Mutex::new(handover.name),
+        directory: Mutex::new(directory),
+        created_at: handover.created_at,
+        shell_pid: handover.shell_pid,
+        pty: Mutex::new(writer),
+        clients: Mutex::new(HashMap::new()),
+        history: Mutex::new(history),
+        notifications: Mutex::new(crate::relay::NotificationScanner::default()),
+        relay: Mutex::new(crate::relay::Relay::default()),
+        commands: Mutex::new(crate::relay::CommandWatch::default()),
+        viewers: Mutex::new(Viewers::default()),
+        shell_killed: AtomicBool::new(false),
+        exiting: AtomicBool::new(false),
+        listener_fd,
+        binary: Binary::current(),
+        upgrade_considered: Mutex::new(None),
+    });
+    spawn_persistence_thread(Arc::clone(&state));
+    run_master(listener, reader, state);
 }
 
 fn close_fd(fd: RawFd) {
@@ -1505,6 +1863,82 @@ fn close_fd(fd: RawFd) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Held by tests that fork and by those a forked child would upset: a
+    /// fork copies every open fd, a socket another test just bound
+    /// included, and that socket then reads as alive.
+    static FORK_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn a_lost_handover_still_finds_the_shell_from_the_terminal() {
+        let _fork = FORK_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let size = unsafe { std::mem::zeroed::<libc::winsize>() };
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        assert_eq!(
+            unsafe { call_openpty(&mut master_fd, &mut slave_fd, &size) },
+            0
+        );
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe {
+                for fd in 3..1024 {
+                    if fd != slave_fd {
+                        libc::close(fd);
+                    }
+                }
+                libc::setsid();
+                libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
+                libc::sleep(5);
+                libc::_exit(0);
+            }
+        }
+        thread::sleep(Duration::from_millis(200));
+        let directory = env::temp_dir().join(format!("termphin-lost-{}", process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("created_at"), "1794600000").unwrap();
+
+        let handover = lost_handover("t1", master_fd, &directory);
+
+        assert_eq!(handover.shell_pid, child);
+        assert_eq!(handover.created_at, 1_794_600_000);
+        assert_eq!(handover.name, "t1");
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            libc::waitpid(child, std::ptr::null_mut(), 0);
+        }
+        close_fd(master_fd);
+        close_fd(slave_fd);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_handover_reads_back_as_written() {
+        let handover = Handover {
+            name: "termphin_6d79be".to_owned(),
+            created_at: 1_794_600_000,
+            shell_pid: 4242,
+            epoch: u64::MAX - 7,
+            total: 123_456,
+            restored: true,
+        };
+        assert_eq!(Handover::decode(&handover.encode()), Some(handover));
+    }
+
+    #[test]
+    fn a_handover_in_another_format_is_refused() {
+        let text = "format=999\nname=x\ncreated_at=1\nshell_pid=2\nepoch=3\ntotal=4\nrestored=0\n";
+        assert_eq!(Handover::decode(text), None);
+        assert_eq!(Handover::decode("name=x\n"), None);
+    }
+
+    #[test]
+    fn the_master_names_its_version_in_a_private_sequence() {
+        let marker = String::from_utf8(master_version_marker()).unwrap();
+        assert!(marker.starts_with("\x1b]5384;termphin-master;"));
+        assert!(marker.ends_with('\x07'));
+        assert!(marker.contains(env!("CARGO_PKG_VERSION")));
+    }
 
     struct TempDir(PathBuf);
 
@@ -1535,6 +1969,7 @@ mod tests {
 
     #[test]
     fn a_socket_nobody_is_listening_on_reads_as_absent() {
+        let _fork = FORK_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = TempDir::new("absent");
         assert!(matches!(
             probe_socket(&dir.0.join("control.sock")),
