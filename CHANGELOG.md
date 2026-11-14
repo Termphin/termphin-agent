@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.17.0 - 2026-11-14
 
 - A program that worked for 20 seconds or more and then stops while it still holds the terminal - an AI agent waiting for an answer, an installer asking to continue - announces it, with no setup and whichever program it is, unless you were typing into it. A log that just went still (`tail -f`, `docker compose up`) does not: the program has to read keys one by one, as interactive programs do, or show a question.
 - A command announced as stopped is not announced again when it ends without having written anything since.
