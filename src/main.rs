@@ -6,6 +6,8 @@ use std::process;
 use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
+mod relay;
+#[cfg(unix)]
 mod unix;
 #[cfg(windows)]
 mod windows;
@@ -236,6 +238,8 @@ usage: termphin <command>
   ls                    list sessions
   rename <old> <new>    rename a session
   kill <name>           end a session
+  notify [title] [body] show a notification in Termphin (or any terminal that
+                        reads OSC 777), e.g. at the end of a long command
   version               print the version
 
 Detach with Ctrl-\\ then d. Ctrl-\\ twice sends it to the program.
@@ -281,6 +285,7 @@ fn run() -> io::Result<()> {
             platform::rename_command(&old_name, &new_name)?;
         }
         "kill" => platform::kill_command(&required_name(args.next())?)?,
+        "notify" => notify_command(args.next(), args.collect::<Vec<_>>().join(" "))?,
         // Internal re-exec target used to detach the session master from the
         // process that spawned it. Not part of the public CLI.
         #[cfg(windows)]
@@ -292,6 +297,38 @@ fn run() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// What `termphin notify` writes: rxvt's `OSC 777 ; notify ; title ; body`,
+/// which Termphin, Ghostty and urxvt show as a notification. Semicolons and
+/// control characters would end the sequence or the field early, so they
+/// are taken out of the text.
+pub(crate) fn notify_sequence(title: &str, body: &str) -> Vec<u8> {
+    fn clean(text: &str) -> String {
+        text.chars()
+            .map(|c| if c == ';' || c.is_control() { ' ' } else { c })
+            .collect::<String>()
+            .trim()
+            .to_owned()
+    }
+    format!("\x1b]777;notify;{};{}\x07", clean(title), clean(body)).into_bytes()
+}
+
+/// Writes the notification to the terminal itself, not to stdout: a hook
+/// runner - Claude Code's among them - captures a hook's stdout, and the
+/// sequence has to reach the screen to be seen. Without a terminal to open
+/// (a cron job) it falls back to stdout.
+fn notify_command(title: Option<String>, body: String) -> io::Result<()> {
+    let title = title.unwrap_or_else(|| "Done".to_owned());
+    let sequence = notify_sequence(&title, &body);
+    #[cfg(unix)]
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        tty.write_all(&sequence)?;
+        return tty.flush();
+    }
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(&sequence)?;
+    stdout.flush()
 }
 
 /// Set in every session's shell, so an attach from inside one can tell.
@@ -1446,6 +1483,22 @@ mod tests {
         let screen = replayed.screen().contents();
         assert!(screen.contains("line 28"));
         assert!(screen.contains("prompt $ "));
+    }
+
+    #[test]
+    fn notify_writes_an_rxvt_notification() {
+        assert_eq!(
+            notify_sequence("Build", "finished in 42s"),
+            b"\x1b]777;notify;Build;finished in 42s\x07"
+        );
+    }
+
+    #[test]
+    fn notify_cannot_end_its_own_sequence_early() {
+        assert_eq!(
+            notify_sequence("a;b", "line\x07one\nline two"),
+            b"\x1b]777;notify;a b;line one line two\x07"
+        );
     }
 
     #[test]

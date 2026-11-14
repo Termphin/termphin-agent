@@ -89,6 +89,21 @@ fn current_boot_id() -> Option<String> {
     (result == 0).then(|| boottime.tv_sec.to_string())
 }
 
+/// The name of the program leading process group [group], where the system
+/// says: `/proc/<pid>/comm` on Linux. macOS has no such file, and the
+/// notification then just says a command finished.
+#[cfg(not(target_os = "macos"))]
+fn command_name(group: i32) -> Option<String> {
+    let name = fs::read_to_string(format!("/proc/{group}/comm")).ok()?;
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn command_name(_group: i32) -> Option<String> {
+    None
+}
+
 #[cfg(not(target_os = "macos"))]
 fn shell_cwd(pid: libc::pid_t) -> Option<PathBuf> {
     fs::read_link(format!("/proc/{pid}/cwd")).ok()
@@ -478,6 +493,9 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
             pty: Mutex::new(writer),
             clients: Mutex::new(HashMap::new()),
             history: Mutex::new(history),
+            notifications: Mutex::new(crate::relay::NotificationScanner::default()),
+            relay: Mutex::new(crate::relay::Relay::default()),
+            commands: Mutex::new(crate::relay::CommandWatch::default()),
             viewers: Mutex::new(Viewers::default()),
             shell_killed: AtomicBool::new(false),
             exiting: AtomicBool::new(false),
@@ -766,6 +784,13 @@ struct MasterState {
     pty: Mutex<File>,
     clients: Mutex<HashMap<u64, Arc<ClientChannel>>>,
     history: Mutex<History>,
+    /// Watches the output for notifications a program asks for, so one sent
+    /// while nobody is attached can still go out through the relay.
+    notifications: Mutex<crate::relay::NotificationScanner>,
+    relay: Mutex<crate::relay::Relay>,
+    /// Notices a long command ending, so it can be announced like a
+    /// notification the program sent itself.
+    commands: Mutex<crate::relay::CommandWatch>,
     viewers: Mutex<Viewers>,
     /// Separate from [`Self::exiting`] on purpose: sharing one flag meant an
     /// explicit `kill` marked the session wound down, and [`Self::finish`]
@@ -852,14 +877,50 @@ impl MasterState {
         if let Some(size) = apply {
             self.resize(to_winsize(size))?;
         }
+        self.commands
+            .lock()
+            .expect("commands mutex poisoned")
+            .typed(std::time::Instant::now());
         self.write_input(data)
+    }
+
+    /// Looks at which process group has the terminal and, when a long
+    /// command has just given it back to the shell, writes the
+    /// notification into the session's output: an attached app shows it,
+    /// and with nobody attached the scanner hands it to the relay.
+    fn watch_command(&self) {
+        let fd = self.pty.lock().expect("pty mutex poisoned").as_raw_fd();
+        let group = unsafe { libc::tcgetpgrp(fd) };
+        let finished = self
+            .commands
+            .lock()
+            .expect("commands mutex poisoned")
+            .observe(
+                (group > 0).then_some(group),
+                self.shell_pid,
+                std::time::Instant::now(),
+                command_name,
+            );
+        if let Some(finished) = finished {
+            self.broadcast_output(&finished.sequence());
+        }
     }
 
     fn broadcast_output(&self, data: &[u8]) {
         let mut history = self.history.lock().expect("history mutex poisoned");
         history.push(data);
+        let found = self
+            .notifications
+            .lock()
+            .expect("notifications mutex poisoned")
+            .feed(data);
         let clients = self.clients.lock().expect("clients mutex poisoned");
         if clients.is_empty() {
+            let name = self.name.lock().expect("name mutex poisoned").clone();
+            let mut relay = self.relay.lock().expect("relay mutex poisoned");
+            for (title, body) in found {
+                relay.send(&title, &body, &name);
+            }
             return;
         }
         let failed = clients
@@ -1421,6 +1482,7 @@ fn spawn_persistence_thread(state: Arc<MasterState>) {
             }
             thread::sleep(CWD_POLL_INTERVAL);
             tick += 1;
+            state.watch_command();
             // The first tick flushes too: a session that dies before the
             // first full interval - a power cut minutes in is rare, seconds
             // in is not - would otherwise have no scrollback on disk at all.

@@ -86,7 +86,34 @@ metadata the app reads, so both always agree on which copy is current.
 termphin attach [name]    attach, choosing one if there are several
 termphin new [name]       start a session and attach to it
 termphin ls               list sessions
+termphin notify [title] [body]
+                          show a notification in Termphin
 ```
+
+`notify` writes an `OSC 777` notification straight to the terminal (not to
+stdout, which a hook runner captures), so Termphin shows it when the session
+is not the one on screen:
+
+```sh
+make release; termphin notify Build "finished with $?"
+```
+
+For Claude Code, a `Stop` hook in `~/.claude/settings.json`:
+
+```json
+{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "termphin notify 'Claude Code' 'Finished'"}]}]}}
+```
+
+Claude Code can also announce itself without the hook: with
+`claude config set --global preferredNotifChannel iterm2` it sends `OSC 9`,
+which Termphin reads too.
+
+A command that runs for 30 seconds or more announces its own end, with no
+setup and in any shell: the session watches which program has the terminal
+and, when the shell gets it back, says which command finished and after how
+long. A command you typed into in its last 15 seconds - an editor, a REPL -
+was being watched, not waited for, and says nothing. On Linux the
+notification names the command; on macOS it says a command finished.
 
 Detach with `Ctrl-\` then `d`. Press `Ctrl-\` twice to send it to the
 program. Detaching resets any modes a program left your terminal in, such as
