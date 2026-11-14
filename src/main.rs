@@ -221,6 +221,7 @@ pub(crate) const RESUME_FORMAT: u32 = 1;
 
 /// Whether `candidate` is a later `major.minor.patch` than `current`.
 /// Anything that does not parse is not later.
+#[cfg(unix)]
 pub(crate) fn newer_version(candidate: &str, current: &str) -> bool {
     fn parse(version: &str) -> Option<(u64, u64, u64)> {
         let mut parts = version.trim().split('.');
@@ -1381,6 +1382,7 @@ mod tests {
         replayed.screen_mut().set_scrollback(0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn versions_compare_by_number_not_by_text() {
         assert!(newer_version("0.16.0", "0.15.0"));
@@ -1391,6 +1393,7 @@ mod tests {
         assert!(!newer_version("garbage", "0.15.0"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_output_log_taken_apart_and_rebuilt_resumes_the_same() {
         let mut log = OutputLog::new(8);
@@ -1406,6 +1409,7 @@ mod tests {
         assert_eq!(rebuilt.since(position).as_deref(), Some(b"rld".as_slice()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_resumed_history_draws_the_same_screen_and_keeps_its_offsets() {
         let mut history = History::new(5, 20);
