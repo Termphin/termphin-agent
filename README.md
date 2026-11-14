@@ -115,6 +115,11 @@ long. A command you typed into in its last 15 seconds - an editor, a REPL -
 was being watched, not waited for, and says nothing. On Linux the
 notification names the command; on macOS it says a command finished.
 
+A new version installed over a running one takes over its sessions in
+place, the next time nobody is attached to them: the shell keeps running,
+nothing in it restarts, and the scrollback carries over. Sessions started
+before 0.16.0 cannot do this and keep their version until they end.
+
 Detach with `Ctrl-\` then `d`. Press `Ctrl-\` twice to send it to the
 program. Detaching resets any modes a program left your terminal in, such as
 the alternate screen, mouse reporting or a hidden cursor.

@@ -168,6 +168,23 @@ impl OutputLog {
         self.bytes.extend(data);
     }
 
+    /// The epoch, the count of bytes ever written and the bytes still kept:
+    /// what a master hands over so offsets keep their meaning after it.
+    pub(crate) fn parts(&self) -> (u64, u64, Vec<u8>) {
+        (self.epoch, self.total, self.bytes.iter().copied().collect())
+    }
+
+    /// The log [`Self::parts`] described.
+    pub(crate) fn from_parts(epoch: u64, total: u64, bytes: &[u8], capacity: usize) -> Self {
+        let bytes = &bytes[bytes.len().saturating_sub(capacity)..];
+        Self {
+            epoch,
+            total: total.max(bytes.len() as u64),
+            bytes: bytes.iter().copied().collect(),
+            capacity,
+        }
+    }
+
     /// Where the next byte will be written.
     pub(crate) fn position(&self) -> OutputPosition {
         OutputPosition {
@@ -193,6 +210,33 @@ impl OutputLog {
                 .copied()
                 .collect(),
         )
+    }
+}
+
+/// The handover a master writes before it execs a newer binary. A binary
+/// that does not print this from `__resume-capable` cannot take a session
+/// over and is never exec'd into one.
+#[cfg(unix)]
+pub(crate) const RESUME_FORMAT: u32 = 1;
+
+/// Whether `candidate` is a later `major.minor.patch` than `current`.
+/// Anything that does not parse is not later.
+pub(crate) fn newer_version(candidate: &str, current: &str) -> bool {
+    fn parse(version: &str) -> Option<(u64, u64, u64)> {
+        let mut parts = version.trim().split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts
+            .next()?
+            .split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()?;
+        Some((major, minor, patch))
+    }
+    match (parse(candidate), parse(current)) {
+        (Some(candidate), Some(current)) => candidate > current,
+        _ => false,
     }
 }
 
@@ -290,6 +334,12 @@ fn run() -> io::Result<()> {
         // process that spawned it. Not part of the public CLI.
         #[cfg(windows)]
         "__master" => windows::run_as_master(args)?,
+        // A running session master asks a new binary whether it can take the
+        // session over, then execs it as `__master-resume`. Not public CLI.
+        #[cfg(unix)]
+        "__resume-capable" => println!("{RESUME_FORMAT}"),
+        #[cfg(unix)]
+        "__master-resume" => unix::resume_master(args.collect())?,
         "help" | "--help" | "-h" => print!("{USAGE}"),
         _ => {
             eprint!("{USAGE}");
@@ -823,6 +873,30 @@ impl History {
         }
     }
 
+    /// A history taken over from a master that exec'd a newer binary: the
+    /// screen as [`Self::snapshot`] drew it, and the raw output log as it
+    /// was, so a client resuming from an offset carries on as if nothing
+    /// had happened.
+    #[cfg(unix)]
+    pub(crate) fn resumed(
+        rows: u16,
+        cols: u16,
+        screen: &[u8],
+        output: OutputLog,
+        restored: bool,
+    ) -> Self {
+        let mut history = Self::new(rows, cols);
+        history.parser.process(screen);
+        history.output = output;
+        history.restored = restored;
+        history
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn restored(&self) -> bool {
+        self.restored
+    }
+
     pub(crate) fn push(&mut self, data: &[u8]) {
         self.parser.process(data);
         #[cfg(unix)]
@@ -1305,6 +1379,48 @@ mod tests {
 
         expected.parser.screen_mut().set_scrollback(0);
         replayed.screen_mut().set_scrollback(0);
+    }
+
+    #[test]
+    fn versions_compare_by_number_not_by_text() {
+        assert!(newer_version("0.16.0", "0.15.0"));
+        assert!(newer_version("0.15.10", "0.15.9"));
+        assert!(newer_version("1.0.0", "0.99.99"));
+        assert!(!newer_version("0.15.0", "0.15.0"));
+        assert!(!newer_version("0.14.0", "0.15.0"));
+        assert!(!newer_version("garbage", "0.15.0"));
+    }
+
+    #[test]
+    fn an_output_log_taken_apart_and_rebuilt_resumes_the_same() {
+        let mut log = OutputLog::new(8);
+        log.push(b"hello, world");
+        let position = OutputPosition {
+            epoch: log.position().epoch,
+            offset: 9,
+        };
+        let (epoch, total, bytes) = log.parts();
+        let rebuilt = OutputLog::from_parts(epoch, total, &bytes, 8);
+        assert_eq!(rebuilt.position(), log.position());
+        assert_eq!(rebuilt.since(position), log.since(position));
+        assert_eq!(rebuilt.since(position).as_deref(), Some(b"rld".as_slice()));
+    }
+
+    #[test]
+    fn a_resumed_history_draws_the_same_screen_and_keeps_its_offsets() {
+        let mut history = History::new(5, 20);
+        history.push(b"line one\r\nline two\r\n\x1b[1mbold\x1b[m");
+        let (epoch, total, bytes) = history.output().parts();
+        let screen = history.snapshot();
+        let mut resumed = History::resumed(
+            5,
+            20,
+            &screen,
+            OutputLog::from_parts(epoch, total, &bytes, OUTPUT_LOG_BYTES),
+            false,
+        );
+        assert_eq!(resumed.output().position(), history.output().position());
+        assert_eq!(resumed.snapshot(), history.snapshot());
     }
 
     #[test]
