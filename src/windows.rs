@@ -9,7 +9,7 @@
 //! `ENABLE_VIRTUAL_TERMINAL_INPUT` consumes the same input-record queue that
 //! would otherwise deliver `WINDOW_BUFFER_SIZE_EVENT`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -62,11 +62,11 @@ use windows_sys::Win32::System::Threading::{
 use crate::win32_codec::{CWD_PROMPT_HOOK, Win32InputDecoder, base64_utf16le};
 use crate::{
     CLIENT_WRITE_TIMEOUT, ClientQueue, DetachKey, Ending, FRAME_ATTACH, FRAME_ERROR, FRAME_EXIT,
-    FRAME_HISTORY, FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_RENAME,
+    FRAME_HISTORY, FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_PRESENCE, FRAME_RENAME,
     FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_STATUS, FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT,
-    History, MAX_CLIENTS, REPLAY_CHUNK_SIZE, REPLAY_END_MARKER, RestoreState,
-    SCROLLBACK_FLUSH_EVERY_TICKS, SESSION_ENV, TermSize, Viewers, decode_size, encode_size,
-    invalid_input, read_frame, send_frame, strip_resize_reports, validate_name,
+    History, MAX_CLIENTS, PRESENCE_BACK_MARKER, PresenceKeys, REPLAY_CHUNK_SIZE, REPLAY_END_MARKER,
+    RestoreState, SCROLLBACK_FLUSH_EVERY_TICKS, SESSION_ENV, TermSize, Viewers, decode_size,
+    encode_size, invalid_input, read_frame, send_frame, strip_resize_reports, validate_name,
 };
 
 /// Ten cheap console reads a second, against a visible lag on every rotation
@@ -908,6 +908,9 @@ struct MasterState {
     pseudo_console: Mutex<PseudoConsole>,
     pty_write: Mutex<SyncPipe>,
     clients: Mutex<HashMap<u64, Arc<ClientChannel>>>,
+    /// Clients whose phone said it went to the background; see
+    /// [`crate::FRAME_PRESENCE`].
+    away: Mutex<HashSet<u64>>,
     history: Mutex<History>,
     viewers: Mutex<Viewers>,
     size: Mutex<TermSize>,
@@ -951,7 +954,42 @@ impl MasterState {
         Ok(())
     }
 
+    /// Whether a phone is looking: a client attached and not away.
+    fn present(&self, clients: &HashMap<u64, Arc<ClientChannel>>) -> bool {
+        crate::anyone_present(
+            clients.keys(),
+            &self.away.lock().expect("away mutex poisoned"),
+        )
+    }
+
+    /// A client's phone went away or came back. Once every client is away,
+    /// the session is left as far as notifications go. One that comes back is
+    /// sent [`PRESENCE_BACK_MARKER`] after whatever was queued for it.
+    fn presence(&self, id: u64, away: bool) -> io::Result<()> {
+        let clients = self.clients.lock().expect("clients mutex poisoned");
+        let was_present = self.present(&clients);
+        {
+            let mut set = self.away.lock().expect("away mutex poisoned");
+            if away {
+                set.insert(id);
+            } else {
+                set.remove(&id);
+            }
+        }
+        if was_present && !self.present(&clients) {
+            self.watchers
+                .lock()
+                .expect("watchers mutex poisoned")
+                .left(std::time::Instant::now());
+        }
+        if !away && let Some(channel) = clients.get(&id) {
+            channel.send(FRAME_OUTPUT, PRESENCE_BACK_MARKER)?;
+        }
+        Ok(())
+    }
+
     fn remove_client(&self, id: u64) {
+        self.away.lock().expect("away mutex poisoned").remove(&id);
         let nobody_left = {
             let mut clients = self.clients.lock().expect("clients mutex poisoned");
             clients.remove(&id).is_some() && clients.is_empty()
@@ -1026,11 +1064,7 @@ impl MasterState {
             .expect("commands mutex poisoned")
             .observe(foreground, shell, now, command_name);
         let writes = self.program_writes.load(Ordering::SeqCst);
-        let attached = !self
-            .clients
-            .lock()
-            .expect("clients mutex poisoned")
-            .is_empty();
+        let attached = self.present(&self.clients.lock().expect("clients mutex poisoned"));
         let ended_at = now.checked_sub(crate::CWD_POLL_INTERVAL).unwrap_or(now);
         let finished = finished.filter(|finished| {
             !self
@@ -1120,12 +1154,14 @@ impl MasterState {
             self.quiet.lock().expect("quiet mutex poisoned").notified();
         }
         let clients = self.clients.lock().expect("clients mutex poisoned");
-        if clients.is_empty() {
+        if !self.present(&clients) {
             let name = self.name.lock().expect("name mutex poisoned").clone();
             let mut relay = self.relay.lock().expect("relay mutex poisoned");
             for notice in &found {
                 relay.send(notice, &name);
             }
+        }
+        if clients.is_empty() {
             return;
         }
         let failed = clients
@@ -1317,6 +1353,7 @@ fn client_loop(id: u64, pipe: AsyncPipe, state: Arc<MasterState>) {
                     .and_then(|size| state.attached_at(id, size))
             }
             FRAME_INPUT if attached => state.input_from(id, &payload),
+            FRAME_PRESENCE if attached => state.presence(id, payload.first() == Some(&1)),
             FRAME_RESIZE if attached => {
                 decode_size(&payload).and_then(|size| state.resized_to(id, size))
             }
@@ -1431,6 +1468,7 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
         pseudo_console: Mutex::new(pseudo_console),
         pty_write: Mutex::new(pty_write),
         clients: Mutex::new(HashMap::new()),
+        away: Mutex::new(HashSet::new()),
         history: Mutex::new(history),
         viewers: Mutex::new(Viewers::default()),
         size: Mutex::new(size),
@@ -1827,6 +1865,7 @@ fn bridge_terminal(
         let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
         let mut buffer = [0_u8; 8192];
         let mut win32_input = Win32InputDecoder::default();
+        let mut presence = PresenceKeys::default();
         loop {
             let mut read = 0u32;
             let ok = unsafe {
@@ -1841,7 +1880,12 @@ fn bridge_terminal(
             if !win_bool(ok) || read == 0 {
                 return;
             }
-            let decoded = win32_input.feed(&buffer[..read as usize]);
+            let (decoded, moves) = presence.feed(&win32_input.feed(&buffer[..read as usize]));
+            for away in moves {
+                if send_frame(&mut &*input_pipe, FRAME_PRESENCE, &[u8::from(away)]).is_err() {
+                    return;
+                }
+            }
             let (forward, detach) = match detach_key.as_mut() {
                 Some(key) => key.feed(&decoded),
                 None => (decoded, false),
