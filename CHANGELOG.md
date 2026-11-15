@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.17.2 - 2026-11-15
+
+- On Windows, Backspace deletes one character again, not the whole word before the cursor. Ctrl+Backspace still deletes the word.
+- On Windows, letters outside ASCII - Polish ones, among others - come through intact both ways.
+
 ## 0.17.1 - 2026-11-14
 
 - A program that stopped while a phone was attached is not announced once the phone has left: whoever put it away saw the stop on screen.

@@ -36,9 +36,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Console::{
     CONSOLE_SCREEN_BUFFER_INFO, COORD, ClosePseudoConsole, CreatePseudoConsole,
-    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode,
-    GetConsoleScreenBufferInfo, GetStdHandle, HPCON, ResizePseudoConsole, STD_INPUT_HANDLE,
-    STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, SetConsoleMode,
+    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleCP,
+    GetConsoleMode, GetConsoleOutputCP, GetConsoleScreenBufferInfo, GetStdHandle, HPCON,
+    ResizePseudoConsole, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCP, SetConsoleCtrlHandler,
+    SetConsoleMode, SetConsoleOutputCP,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -1918,11 +1919,21 @@ fn bridge_terminal(
     }
 }
 
+/// UTF-8's code page number, `CP_UTF8`.
+const UTF8_CODE_PAGE: u32 = 65001;
+
+/// The attach client's console set up for relaying a session: raw VT input
+/// and output, and UTF-8 both ways. Without the code pages the session's
+/// UTF-8 output is read in the console's OEM code page (852, 437...), and
+/// every letter outside ASCII - Polish ones among them - turns to garbage.
+/// Everything is put back when it drops.
 struct ConsoleRawMode {
     stdin: HANDLE,
     original_input_mode: u32,
     stdout: HANDLE,
     original_output_mode: u32,
+    original_input_cp: u32,
+    original_output_cp: u32,
 }
 
 impl ConsoleRawMode {
@@ -1935,6 +1946,8 @@ impl ConsoleRawMode {
         // same as `isatty` false on the Unix side - nothing to restore.
         let has_console = win_bool(unsafe { GetConsoleMode(stdin, &mut original_input_mode) })
             && win_bool(unsafe { GetConsoleMode(stdout, &mut original_output_mode) });
+        let original_input_cp = unsafe { GetConsoleCP() };
+        let original_output_cp = unsafe { GetConsoleOutputCP() };
         if has_console {
             unsafe {
                 SetConsoleMode(stdin, ENABLE_VIRTUAL_TERMINAL_INPUT);
@@ -1942,6 +1955,8 @@ impl ConsoleRawMode {
                     stdout,
                     original_output_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
                 );
+                SetConsoleCP(UTF8_CODE_PAGE);
+                SetConsoleOutputCP(UTF8_CODE_PAGE);
             }
         }
         Ok(Self {
@@ -1949,6 +1964,8 @@ impl ConsoleRawMode {
             original_input_mode,
             stdout,
             original_output_mode,
+            original_input_cp,
+            original_output_cp,
         })
     }
 }
@@ -1958,6 +1975,12 @@ impl Drop for ConsoleRawMode {
         unsafe {
             SetConsoleMode(self.stdin, self.original_input_mode);
             SetConsoleMode(self.stdout, self.original_output_mode);
+            if self.original_input_cp != 0 {
+                SetConsoleCP(self.original_input_cp);
+            }
+            if self.original_output_cp != 0 {
+                SetConsoleOutputCP(self.original_output_cp);
+            }
         }
     }
 }
