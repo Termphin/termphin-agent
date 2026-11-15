@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.18.0 - 2026-11-15
+
+- A phone that goes to the background can say so, and while every phone attached is away the session's notifications go through the relay as if none were attached. An iPhone keeps its connection open while iOS has the app frozen, so until now a command finishing behind a minimized app was only announced once the app came back.
+- A phone that comes back is told where the output queued while it was away ends, so the app does not announce again what the relay already delivered.
+
 ## 0.17.2 - 2026-11-15
 
 - On Windows, Backspace deletes one character again, not the whole word before the cursor. Ctrl+Backspace still deletes the word.

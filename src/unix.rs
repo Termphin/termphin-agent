@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -17,11 +17,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::{
     CLIENT_WRITE_TIMEOUT, CWD_POLL_INTERVAL, ClientQueue, DetachKey, Ending, FRAME_ATTACH,
     FRAME_ERROR, FRAME_EXIT, FRAME_HISTORY, FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT,
-    FRAME_RENAME, FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_RESUME, FRAME_RESUME_DONE, FRAME_STATUS,
-    FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT, History, MAX_CLIENTS, OutputPosition,
-    REPLAY_CHUNK_SIZE, REPLAY_END_MARKER, RESUME_END_MARKER, RestoreState,
-    SCROLLBACK_FLUSH_EVERY_TICKS, SESSION_ENV, TermSize, Viewers, decode_size, encode_size,
-    invalid_input, offset_marker, read_frame, send_frame, validate_name,
+    FRAME_PRESENCE, FRAME_RENAME, FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_RESUME, FRAME_RESUME_DONE,
+    FRAME_STATUS, FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT, History, MAX_CLIENTS, OutputPosition,
+    PRESENCE_BACK_MARKER, PresenceKeys, REPLAY_CHUNK_SIZE, REPLAY_END_MARKER, RESUME_END_MARKER,
+    RestoreState, SCROLLBACK_FLUSH_EVERY_TICKS, SESSION_ENV, TermSize, Viewers, decode_size,
+    encode_size, invalid_input, offset_marker, read_frame, send_frame, validate_name,
 };
 
 static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
@@ -563,6 +563,7 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
             shell_pid,
             pty: Mutex::new(writer),
             clients: Mutex::new(HashMap::new()),
+            away: Mutex::new(HashSet::new()),
             history: Mutex::new(history),
             notifications: Mutex::new(crate::relay::NotificationScanner::default()),
             relay: Mutex::new(crate::relay::Relay::default()),
@@ -862,6 +863,9 @@ struct MasterState {
     shell_pid: libc::pid_t,
     pty: Mutex<File>,
     clients: Mutex<HashMap<u64, Arc<ClientChannel>>>,
+    /// Clients whose phone said it went to the background; see
+    /// [`crate::FRAME_PRESENCE`].
+    away: Mutex<HashSet<u64>>,
     history: Mutex<History>,
     /// Watches the output for notifications a program asks for, so one sent
     /// while nobody is attached can still go out through the relay.
@@ -958,7 +962,42 @@ impl MasterState {
         Ok(())
     }
 
+    /// Whether a phone is looking: a client attached and not away.
+    fn present(&self, clients: &HashMap<u64, Arc<ClientChannel>>) -> bool {
+        crate::anyone_present(
+            clients.keys(),
+            &self.away.lock().expect("away mutex poisoned"),
+        )
+    }
+
+    /// A client's phone went away or came back. Once every client is away,
+    /// the session is left as far as notifications go. One that comes back is
+    /// sent [`PRESENCE_BACK_MARKER`] after whatever was queued for it.
+    fn presence(&self, id: u64, away: bool) -> io::Result<()> {
+        let clients = self.clients.lock().expect("clients mutex poisoned");
+        let was_present = self.present(&clients);
+        {
+            let mut set = self.away.lock().expect("away mutex poisoned");
+            if away {
+                set.insert(id);
+            } else {
+                set.remove(&id);
+            }
+        }
+        if was_present && !self.present(&clients) {
+            self.watchers
+                .lock()
+                .expect("watchers mutex poisoned")
+                .left(std::time::Instant::now());
+        }
+        if !away && let Some(channel) = clients.get(&id) {
+            channel.send(FRAME_OUTPUT, PRESENCE_BACK_MARKER)?;
+        }
+        Ok(())
+    }
+
     fn remove_client(&self, id: u64) {
+        self.away.lock().expect("away mutex poisoned").remove(&id);
         let nobody_left = {
             let mut clients = self.clients.lock().expect("clients mutex poisoned");
             clients.remove(&id).is_some() && clients.is_empty()
@@ -1036,11 +1075,7 @@ impl MasterState {
             );
         let now = std::time::Instant::now();
         let writes = self.program_writes.load(Ordering::SeqCst);
-        let attached = !self
-            .clients
-            .lock()
-            .expect("clients mutex poisoned")
-            .is_empty();
+        let attached = self.present(&self.clients.lock().expect("clients mutex poisoned"));
         let ended_at = now.checked_sub(crate::CWD_POLL_INTERVAL).unwrap_or(now);
         let finished = finished.filter(|finished| {
             !self
@@ -1132,12 +1167,14 @@ impl MasterState {
             self.quiet.lock().expect("quiet mutex poisoned").notified();
         }
         let clients = self.clients.lock().expect("clients mutex poisoned");
-        if clients.is_empty() {
+        if !self.present(&clients) {
             let name = self.name.lock().expect("name mutex poisoned").clone();
             let mut relay = self.relay.lock().expect("relay mutex poisoned");
             for notice in &found {
                 relay.send(notice, &name);
             }
+        }
+        if clients.is_empty() {
             return;
         }
         let failed = clients
@@ -1435,6 +1472,7 @@ fn client_loop(id: u64, mut stream: UnixStream, state: Arc<MasterState>) {
                     .and_then(|size| state.attached_at(id, size))
             }
             FRAME_INPUT if attached => state.input_from(id, &payload),
+            FRAME_PRESENCE if attached => state.presence(id, payload.first() == Some(&1)),
             FRAME_RESIZE if attached => {
                 decode_size(&payload).and_then(|size| state.resized_to(id, size))
             }
@@ -1581,6 +1619,7 @@ fn bridge_terminal(
     let mut buffer = [0_u8; 8192];
     let mut tolerated_legacy_errors = optional_frames;
     let mut painted = false;
+    let mut presence = PresenceKeys::default();
 
     loop {
         if RESIZE_PENDING.swap(false, Ordering::SeqCst) {
@@ -1617,10 +1656,15 @@ fn bridge_terminal(
             if count == 0 {
                 return Ok(Attachment::Finished);
             }
+            let (typed, moves) = presence.feed(&buffer[..count]);
+            for away in moves {
+                send_frame(&mut stream, FRAME_PRESENCE, &[u8::from(away)])?;
+            }
             match detach_key.as_mut() {
-                None => send_frame(&mut stream, FRAME_INPUT, &buffer[..count])?,
+                None if typed.is_empty() => {}
+                None => send_frame(&mut stream, FRAME_INPUT, &typed)?,
                 Some(key) => {
-                    let (forward, detached) = key.feed(&buffer[..count]);
+                    let (forward, detached) = key.feed(&typed);
                     if !forward.is_empty() {
                         send_frame(&mut stream, FRAME_INPUT, &forward)?;
                     }
@@ -2005,6 +2049,7 @@ pub(crate) fn resume_master(args: Vec<String>) -> io::Result<()> {
         shell_pid: handover.shell_pid,
         pty: Mutex::new(writer),
         clients: Mutex::new(HashMap::new()),
+        away: Mutex::new(HashSet::new()),
         history: Mutex::new(history),
         notifications: Mutex::new(crate::relay::NotificationScanner::default()),
         relay: Mutex::new(crate::relay::Relay::default()),

@@ -43,6 +43,12 @@ pub(crate) const FRAME_HISTORY: u8 = 7;
 /// left [`OUTPUT_LOG_BYTES`].
 #[cfg(unix)]
 pub(crate) const FRAME_RESUME: u8 = 8;
+/// Client to master: the phone behind this client has gone to the
+/// background (payload `[1]`) or come back (`[0]`). iOS freezes a
+/// backgrounded app without closing its connection, so to the master it
+/// would still look attached; while every client is away, notifications go
+/// to the relay as they would with none attached.
+pub(crate) const FRAME_PRESENCE: u8 = 9;
 
 pub(crate) const FRAME_OUTPUT: u8 = 101;
 pub(crate) const FRAME_STATUS_RESPONSE: u8 = 102;
@@ -596,6 +602,74 @@ impl DetachKey {
     }
 }
 
+/// What the app types to say its phone went away, never reaching the shell:
+/// a private OSC that no terminal sends as input of its own.
+pub(crate) const PRESENCE_AWAY: &[u8] = b"\x1b]5386;away\x07";
+
+/// What the app types to say its phone is back.
+pub(crate) const PRESENCE_BACK: &[u8] = b"\x1b]5386;back\x07";
+
+/// What the master sends a client that came back, after everything queued
+/// for it while it was away: the app shows nothing for notifications that
+/// arrive before it, since the relay already delivered them.
+pub(crate) const PRESENCE_BACK_MARKER: &[u8] = b"\x1b]5386;termphin-back\x07";
+
+/// Whether a phone is looking at the session: some client is attached and
+/// has not said it went away. With nobody away - every phone but an iPhone,
+/// which is the only one that says so - this is just whether anyone is
+/// attached, as it always was.
+pub(crate) fn anyone_present<'a>(
+    clients: impl IntoIterator<Item = &'a u64>,
+    away: &std::collections::HashSet<u64>,
+) -> bool {
+    clients.into_iter().any(|id| !away.contains(id))
+}
+
+/// Takes the app's presence messages out of what is typed, the way
+/// [`DetachKey`] takes the detach key out.
+#[derive(Default)]
+pub(crate) struct PresenceKeys {
+    pending: Vec<u8>,
+}
+
+impl PresenceKeys {
+    /// The input to send on, and the presence messages found in it in order:
+    /// `true` for away, `false` for back.
+    ///
+    /// A message cut off at the end of a read is held for the next one. Only
+    /// from `ESC ]` on, so an Escape pressed on its own is never held back.
+    pub(crate) fn feed(&mut self, input: &[u8]) -> (Vec<u8>, Vec<bool>) {
+        let mut data = std::mem::take(&mut self.pending);
+        data.extend_from_slice(input);
+        let mut forward = Vec::with_capacity(data.len());
+        let mut events = Vec::new();
+        let mut index = 0;
+        while index < data.len() {
+            let rest = &data[index..];
+            if rest.starts_with(PRESENCE_AWAY) {
+                events.push(true);
+                index += PRESENCE_AWAY.len();
+                continue;
+            }
+            if rest.starts_with(PRESENCE_BACK) {
+                events.push(false);
+                index += PRESENCE_BACK.len();
+                continue;
+            }
+            if rest.len() >= 2
+                && rest[0] == 0x1b
+                && (PRESENCE_AWAY.starts_with(rest) || PRESENCE_BACK.starts_with(rest))
+            {
+                self.pending = rest.to_vec();
+                break;
+            }
+            forward.push(data[index]);
+            index += 1;
+        }
+        (forward, events)
+    }
+}
+
 /// Drops ConPTY's `CSI 8 ; rows ; cols t` from its output. It sends one after
 /// every resize to tell the terminal the new size, and a client whose own
 /// console obeys it shrinks to match whoever resized last - after which that
@@ -1084,6 +1158,47 @@ mod tests {
 
     fn size(cols: u16, rows: u16) -> TermSize {
         TermSize { cols, rows }
+    }
+
+    #[test]
+    fn with_nobody_away_presence_is_just_being_attached() {
+        let away = std::collections::HashSet::new();
+        assert!(!anyone_present(&[], &away));
+        assert!(anyone_present(&[1, 2], &away));
+    }
+
+    #[test]
+    fn a_session_whose_every_phone_is_away_counts_as_left() {
+        let away: std::collections::HashSet<u64> = [1, 2].into();
+        assert!(!anyone_present(&[1, 2], &away));
+        assert!(anyone_present(&[1, 2, 3], &away));
+    }
+
+    #[test]
+    fn presence_messages_are_taken_out_of_the_input() {
+        let mut keys = PresenceKeys::default();
+        let (forward, events) = keys.feed(b"ls\x1b]5386;away\x07\x1b]5386;back\x07\r");
+        assert_eq!(forward, b"ls\r".to_vec());
+        assert_eq!(events, vec![true, false]);
+    }
+
+    #[test]
+    fn a_presence_message_split_across_reads_is_still_found() {
+        let mut keys = PresenceKeys::default();
+        let (first, none) = keys.feed(b"a\x1b]5386;aw");
+        assert_eq!(first, b"a".to_vec());
+        assert!(none.is_empty());
+        let (second, events) = keys.feed(b"ay\x07b");
+        assert_eq!(second, b"b".to_vec());
+        assert_eq!(events, vec![true]);
+    }
+
+    #[test]
+    fn escape_and_other_sequences_pass_straight_through() {
+        let mut keys = PresenceKeys::default();
+        assert_eq!(keys.feed(b"\x1b").0, b"\x1b".to_vec());
+        assert_eq!(keys.feed(b"\x1b[A").0, b"\x1b[A".to_vec());
+        assert_eq!(keys.feed(b"\x1b]52;c;x\x07").0, b"\x1b]52;c;x\x07".to_vec());
     }
 
     #[test]
