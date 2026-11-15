@@ -7,6 +7,12 @@
 /// (`ESC[A` arrives as three separate `Vk=0` char events), which our inner
 /// ConPTY then mis-delivers to the shell the same way. Decoding back to
 /// plain bytes lets the inner ConPTY parse `ESC[A` itself.
+/// `VK_BACK`, the Backspace key's virtual-key code.
+const VK_BACK: u32 = 0x08;
+
+/// Either Ctrl key in a key event's control-key state.
+const CTRL_PRESSED: u32 = 0x0004 | 0x0008;
+
 #[derive(Default)]
 pub(crate) struct Win32InputDecoder {
     pending: Vec<u8>,
@@ -53,17 +59,28 @@ impl Win32InputDecoder {
         output
     }
 
+    /// One key event as the bytes a terminal would have sent for it.
+    ///
+    /// Backspace is the one key whose character is not those bytes: the
+    /// outer ConPTY turns the DEL a terminal sends into `VK_BACK` carrying
+    /// `0x08`, and handing `0x08` on makes the inner ConPTY read it as
+    /// Ctrl+Backspace - which PSReadLine binds to deleting the whole word.
+    /// So Backspace goes on as DEL again, and Ctrl+Backspace as `0x08`.
     fn decode_body(&mut self, body: &[u8]) -> Option<Vec<u8>> {
         let text = std::str::from_utf8(body).ok()?;
         let mut parts = text.split(';');
-        let _vk: u32 = parts.next()?.parse().ok()?;
+        let vk: u32 = parts.next()?.parse().ok()?;
         let _sc: u32 = parts.next()?.parse().ok()?;
         let uc: u32 = parts.next()?.parse().ok()?;
         let kd: u32 = parts.next()?.parse().ok()?;
-        let _cs: u32 = parts.next()?.parse().ok()?;
+        let cs: u32 = parts.next()?.parse().ok()?;
         let _rc: u32 = parts.next()?.parse().ok()?;
         if kd != 1 || uc == 0 {
             return Some(Vec::new());
+        }
+        if vk == VK_BACK {
+            self.high_surrogate = None;
+            return Some(vec![if cs & CTRL_PRESSED != 0 { 0x08 } else { 0x7f }]);
         }
         let unit = uc as u16;
         if (0xD800..=0xDBFF).contains(&unit) {
@@ -259,6 +276,28 @@ mod win32_input_decoder_tests {
                 "{sequence:?} was swallowed"
             );
         }
+    }
+
+    /// What the outer ConPTY makes of the DEL a terminal sends for
+    /// Backspace: `VK_BACK` carrying `0x08`.
+    #[test]
+    fn backspace_goes_on_as_del_so_powershell_deletes_one_character() {
+        let mut decoder = Win32InputDecoder::default();
+        let decoded = decoder.feed(b"\x1b[8;14;8;1;0;1_\x1b[8;14;8;0;0;1_");
+        assert_eq!(decoded, vec![0x7f]);
+    }
+
+    #[test]
+    fn ctrl_backspace_still_deletes_the_word() {
+        let mut decoder = Win32InputDecoder::default();
+        assert_eq!(decoder.feed(b"\x1b[8;14;127;1;8;1_"), vec![0x08]);
+    }
+
+    #[test]
+    fn a_polish_letter_arrives_as_utf8() {
+        let mut decoder = Win32InputDecoder::default();
+        let decoded = decoder.feed(b"\x1b[0;0;261;1;0;1_\x1b[0;0;380;1;0;1_");
+        assert_eq!(decoded, "ąż".as_bytes().to_vec());
     }
 
     #[test]
