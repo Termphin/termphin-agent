@@ -1043,7 +1043,24 @@ impl History {
         }
     }
 
+    /// The session as a terminal of its own size is shown it: the snapshot
+    /// saved to disk and handed to a new version, replayed into a parser
+    /// just like this one.
     pub(crate) fn snapshot(&mut self) -> Vec<u8> {
+        let (rows, _) = self.parser.screen().size();
+        self.snapshot_for(rows)
+    }
+
+    /// The session as a client `client_rows` tall is shown it on attach.
+    ///
+    /// That client is not always the size this screen still has - the one
+    /// that resized it last may have been taller, or the phone's keyboard
+    /// may be open now - and the size it asks for is only applied after the
+    /// replay. So the primary screen is not cleared and redrawn at absolute
+    /// rows, which loses or blanks rows whenever the two heights differ, but
+    /// written on after the scrollback as more of the same text, the cursor
+    /// put back relative to the last row written.
+    pub(crate) fn snapshot_for(&mut self, client_rows: u16) -> Vec<u8> {
         let mut output = Vec::new();
         if self.restored {
             output.extend(REBOOT_RESTORED_MARKER);
@@ -1054,19 +1071,33 @@ impl History {
             output.push(0x07);
         }
         output.extend(b"\x1b[H\x1b[2J\x1b[3J");
-        output.extend(self.scrollback_lines());
         if self.parser.screen().alternate_screen() {
             output.extend(b"\x1b[?1049h");
+            output.extend(self.parser.screen().state_formatted());
+            return output;
         }
-        output.extend(self.parser.screen().state_formatted());
+        output.extend(self.primary_lines(client_rows));
+        let screen = self.parser.screen();
+        output.extend(screen.attributes_formatted());
+        output.extend(if screen.hide_cursor() {
+            b"\x1b[?25l"
+        } else {
+            b"\x1b[?25h"
+        });
+        output.extend(screen.input_mode_formatted());
         output
     }
 
-    fn scrollback_lines(&mut self) -> Vec<u8> {
+    /// The scrollback and then the screen, row after row, a row the
+    /// terminal wrapped running on into the next one - across the top of
+    /// the screen too, or a line that wrapped there is torn in two.
+    ///
+    /// The blank rows below the cursor are written only to a client at least
+    /// as tall as this screen, where they keep the screen's own layout - a
+    /// prompt at the top after `clear`. To a shorter one they would push
+    /// the cursor's row up past where it is put back.
+    fn primary_lines(&mut self, client_rows: u16) -> Vec<u8> {
         let screen = self.parser.screen_mut();
-        if screen.alternate_screen() {
-            return Vec::new();
-        }
         let (rows, cols) = screen.size();
         screen.set_scrollback(usize::MAX);
         let depth = screen.scrollback();
@@ -1076,23 +1107,40 @@ impl History {
             if let Some(line) = screen.rows_formatted(0, cols).next() {
                 output.extend(line);
                 output.extend(b"\x1b[m");
-
-                let should_skip_crlf = n > 1
-                    && screen.row_wrapped(0)
-                    && screen
-                        .cell(0, cols - 1)
-                        .is_some_and(|cell| cell.has_contents() || cell.is_wide_continuation());
-
-                if !should_skip_crlf {
+                if !runs_on(screen, 0, cols) {
                     output.extend(b"\r\n");
                 }
             }
         }
-        output.extend(std::iter::repeat_n(
-            b'\n',
-            depth.min(rows.saturating_sub(1).into()),
-        ));
         screen.set_scrollback(0);
+
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        let lines: Vec<Vec<u8>> = screen.rows_formatted(0, cols).collect();
+        let last = if client_rows >= rows {
+            rows.saturating_sub(1)
+        } else {
+            lines
+                .iter()
+                .rposition(|line| !line.is_empty())
+                .and_then(|row| u16::try_from(row).ok())
+                .unwrap_or(0)
+                .max(cursor_row)
+        };
+        for (row, line) in (0..=last).zip(&lines) {
+            output.extend(line);
+            output.extend(b"\x1b[m");
+            if row < last && !runs_on(screen, row, cols) {
+                output.extend(b"\r\n");
+            }
+        }
+        output.push(b'\r');
+        let up = last.saturating_sub(cursor_row);
+        if up > 0 {
+            output.extend(format!("\x1b[{up}A").as_bytes());
+        }
+        if cursor_col > 0 {
+            output.extend(format!("\x1b[{cursor_col}C").as_bytes());
+        }
         output
     }
 
@@ -1109,6 +1157,16 @@ impl History {
                 .as_slice()
         });
     }
+}
+
+/// Whether `row` of the visible rows runs on into the next one: the
+/// terminal wrapped it, and its last column is written, so the client's own
+/// wrap carries the text on where this one's did.
+fn runs_on(screen: &vt100::Screen, row: u16, cols: u16) -> bool {
+    screen.row_wrapped(row)
+        && screen
+            .cell(row, cols - 1)
+            .is_some_and(|cell| cell.has_contents() || cell.is_wide_continuation())
 }
 
 /// Queued-but-unwritten frames for one attached client. Platform-neutral: the
@@ -1889,5 +1947,107 @@ mod tests {
         replayed.screen_mut().set_scrollback(usize::MAX);
         let contents = replayed.screen().contents();
         assert!(contents.contains(&long_line));
+    }
+
+    fn ping(seq: usize) -> String {
+        format!(
+            "64 bytes from 1.1.1.1: icmp_seq={seq} ttl=55 time=7.8{} ms",
+            seq % 10
+        )
+    }
+
+    /// Every line a replayed terminal holds, scrollback first, with the rows
+    /// a wrap carried on joined back into one and the blank rows below the
+    /// last line dropped.
+    fn logical_lines(parser: &mut vt100::Parser) -> Vec<String> {
+        let (rows, cols) = parser.screen().size();
+        let mut lines = Vec::new();
+        let mut current = String::new();
+        let mut take = |screen: &vt100::Screen, row: u16| {
+            current.push_str(&screen.contents_between(row, 0, row, cols));
+            if !screen.row_wrapped(row) {
+                lines.push(std::mem::take(&mut current));
+            }
+        };
+        parser.screen_mut().set_scrollback(usize::MAX);
+        for n in (1..=parser.screen().scrollback()).rev() {
+            parser.screen_mut().set_scrollback(n);
+            take(parser.screen(), 0);
+        }
+        parser.screen_mut().set_scrollback(0);
+        for row in 0..rows {
+            take(parser.screen(), row);
+        }
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines
+    }
+
+    #[test]
+    fn a_line_wrapped_across_the_top_of_the_screen_is_replayed_whole() {
+        let mut history = History::new(20, 50);
+        for seq in 1..=30 {
+            history.push(format!("{}\r\n", ping(seq)).as_bytes());
+        }
+
+        let mut replayed = vt100::Parser::new(20, 50, SCROLLBACK_ROWS);
+        replayed.process(&history.snapshot());
+
+        let expected: Vec<String> = (1..=30).map(ping).collect();
+        assert_eq!(logical_lines(&mut replayed), expected);
+        assert_same_screen(&history, &replayed);
+    }
+
+    #[test]
+    fn a_shorter_client_is_replayed_no_blank_rows() {
+        let mut history = History::new(20, 50);
+        for seq in 1..=30 {
+            history.push(format!("{}\r\n", ping(seq)).as_bytes());
+        }
+
+        let mut replayed = vt100::Parser::new(12, 50, SCROLLBACK_ROWS);
+        replayed.process(&history.snapshot_for(12));
+
+        let expected: Vec<String> = (1..=30).map(ping).collect();
+        assert_eq!(logical_lines(&mut replayed), expected);
+        let (row, col) = replayed.screen().cursor_position();
+        assert_eq!((row, col), (11, 0));
+        assert_eq!(
+            replayed.screen().contents_between(10, 0, 10, 50),
+            &ping(30)[50..]
+        );
+    }
+
+    #[test]
+    fn a_taller_client_keeps_the_scrollback_the_screen_covered() {
+        let mut history = History::new(12, 50);
+        for seq in 1..=30 {
+            history.push(format!("{}\r\n", ping(seq)).as_bytes());
+        }
+
+        let mut replayed = vt100::Parser::new(20, 50, SCROLLBACK_ROWS);
+        replayed.process(&history.snapshot_for(20));
+
+        let expected: Vec<String> = (1..=30).map(ping).collect();
+        assert_eq!(logical_lines(&mut replayed), expected);
+    }
+
+    #[test]
+    fn the_cursor_lands_where_it_was_on_a_shorter_client() {
+        let mut history = History::new(20, 50);
+        for seq in 1..=30 {
+            history.push(format!("{}\r\n", ping(seq)).as_bytes());
+        }
+        history.push(b"$ echo hi\x1b[3D");
+
+        let mut replayed = vt100::Parser::new(12, 50, SCROLLBACK_ROWS);
+        replayed.process(&history.snapshot_for(12));
+
+        assert_eq!(replayed.screen().cursor_position(), (11, 6));
+        assert_eq!(
+            replayed.screen().contents_between(11, 0, 11, 50),
+            "$ echo hi"
+        );
     }
 }

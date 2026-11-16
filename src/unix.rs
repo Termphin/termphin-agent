@@ -935,6 +935,7 @@ impl MasterState {
         channel: Arc<ClientChannel>,
         replay: bool,
         resume: Option<OutputPosition>,
+        client_rows: u16,
     ) -> io::Result<()> {
         // Held across both steps so output arriving mid-replay queues behind the
         // snapshot. Queueing never blocks, so a slow client cannot hold the PTY
@@ -949,7 +950,7 @@ impl MasterState {
             let position = history.output().position();
             channel.send(FRAME_RESUME_DONE, &position.encode())?;
         } else if replay {
-            for chunk in history.snapshot().chunks(REPLAY_CHUNK_SIZE) {
+            for chunk in history.snapshot_for(client_rows).chunks(REPLAY_CHUNK_SIZE) {
                 channel.send(FRAME_OUTPUT, chunk)?;
             }
             let position = history.output().position();
@@ -1458,19 +1459,21 @@ fn client_loop(id: u64, mut stream: UnixStream, state: Arc<MasterState>) {
             FRAME_RESUME if !attached => OutputPosition::decode(&payload).map(|position| {
                 resume_from = Some(position);
             }),
-            FRAME_ATTACH => {
-                let attach_result = if !attached {
+            FRAME_ATTACH => decode_size(&payload).and_then(|size| {
+                if !attached {
                     attached = true;
                     // An attached client may idle for hours between keystrokes.
                     let _ = stream.set_read_timeout(None);
-                    state.add_client(id, Arc::clone(&writer), replay_requested, resume_from)
-                } else {
-                    Ok(())
-                };
-                attach_result
-                    .and_then(|_| decode_size(&payload))
-                    .and_then(|size| state.attached_at(id, size))
-            }
+                    state.add_client(
+                        id,
+                        Arc::clone(&writer),
+                        replay_requested,
+                        resume_from,
+                        size.rows,
+                    )?;
+                }
+                state.attached_at(id, size)
+            }),
             FRAME_INPUT if attached => state.input_from(id, &payload),
             FRAME_PRESENCE if attached => state.presence(id, payload.first() == Some(&1)),
             FRAME_RESIZE if attached => {

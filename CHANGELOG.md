@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.18.1 - 2026-11-16
+
+- A phone that comes back to a session is shown it at its own size. A line that wrapped across the top of the screen is no longer torn in two, a phone shorter than the screen was (its keyboard open) no longer gets a run of empty lines in the middle of the output, and a taller one no longer loses the lines that were just above the screen.
+
 ## 0.18.0 - 2026-11-15
 
 - A phone that goes to the background can say so, and while every phone attached is away the session's notifications go through the relay as if none were attached. An iPhone keeps its connection open while iOS has the app frozen, so until now a command finishing behind a minimized app was only announced once the app came back.

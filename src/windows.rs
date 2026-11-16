@@ -938,11 +938,17 @@ struct MasterState {
 }
 
 impl MasterState {
-    fn add_client(&self, id: u64, channel: Arc<ClientChannel>, replay: bool) -> io::Result<()> {
+    fn add_client(
+        &self,
+        id: u64,
+        channel: Arc<ClientChannel>,
+        replay: bool,
+        client_rows: u16,
+    ) -> io::Result<()> {
         let mut history = self.history.lock().expect("history mutex poisoned");
         channel.send(FRAME_OUTPUT, &crate::master_version_marker())?;
         if replay {
-            for chunk in history.snapshot().chunks(REPLAY_CHUNK_SIZE) {
+            for chunk in history.snapshot_for(client_rows).chunks(REPLAY_CHUNK_SIZE) {
                 channel.send(FRAME_OUTPUT, chunk)?;
             }
             channel.send(FRAME_REPLAY_DONE, &[])?;
@@ -1341,17 +1347,13 @@ fn client_loop(id: u64, pipe: AsyncPipe, state: Arc<MasterState>) {
                 replay_requested = true;
                 Ok(())
             }
-            FRAME_ATTACH => {
-                let attach_result = if !attached {
+            FRAME_ATTACH => decode_size(&payload).and_then(|size| {
+                if !attached {
                     attached = true;
-                    state.add_client(id, Arc::clone(&writer), replay_requested)
-                } else {
-                    Ok(())
-                };
-                attach_result
-                    .and_then(|_| decode_size(&payload))
-                    .and_then(|size| state.attached_at(id, size))
-            }
+                    state.add_client(id, Arc::clone(&writer), replay_requested, size.rows)?;
+                }
+                state.attached_at(id, size)
+            }),
             FRAME_INPUT if attached => state.input_from(id, &payload),
             FRAME_PRESENCE if attached => state.presence(id, payload.first() == Some(&1)),
             FRAME_RESIZE if attached => {
