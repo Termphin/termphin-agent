@@ -15,13 +15,15 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
-    CLIENT_WRITE_TIMEOUT, CWD_POLL_INTERVAL, ClientQueue, DetachKey, Ending, FRAME_ATTACH,
-    FRAME_ERROR, FRAME_EXIT, FRAME_HISTORY, FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT,
-    FRAME_PRESENCE, FRAME_RENAME, FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_RESUME, FRAME_RESUME_DONE,
-    FRAME_STATUS, FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT, History, MAX_CLIENTS, OutputPosition,
-    PRESENCE_BACK_MARKER, PresenceKeys, REPLAY_CHUNK_SIZE, REPLAY_END_MARKER, RESUME_END_MARKER,
-    RestoreState, SCROLLBACK_FLUSH_EVERY_TICKS, SESSION_ENV, TermSize, Viewers, decode_size,
-    encode_size, invalid_input, offset_marker, read_frame, send_frame, validate_name,
+    CLIENT_WRITE_TIMEOUT, CONTROL_JOIN, CONTROL_TAKE, CWD_POLL_INTERVAL, ClientQueue, DetachKey,
+    Ending, FRAME_ATTACH, FRAME_CONTROL, FRAME_CONTROL_STATE, FRAME_DEVICE, FRAME_ERROR,
+    FRAME_EXIT, FRAME_HISTORY, FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_PRESENCE,
+    FRAME_RENAME, FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_RESUME, FRAME_RESUME_DONE, FRAME_STATUS,
+    FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT, History, MAX_CLIENTS, OutputPosition,
+    PRESENCE_BACK_MARKER, PresenceEvent, PresenceKeys, REPLAY_CHUNK_SIZE, REPLAY_END_MARKER,
+    RESUME_END_MARKER, RestoreState, SCROLLBACK_FLUSH_EVERY_TICKS, SESSION_ENV, TermSize, Typed,
+    Viewers, control_marker, decode_size, devices_field, encode_control_state, encode_size,
+    invalid_input, offset_marker, read_frame, send_frame, validate_name,
 };
 
 static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
@@ -232,7 +234,12 @@ impl Drop for CreationLock {
     }
 }
 
-pub(crate) fn attach_command(name: &str, replay: bool, resume: Option<String>) -> io::Result<()> {
+pub(crate) fn attach_command(
+    name: &str,
+    replay: bool,
+    resume: Option<String>,
+    control: bool,
+) -> io::Result<()> {
     let resume = resume
         .map(|value| {
             OutputPosition::parse(&value)
@@ -243,14 +250,14 @@ pub(crate) fn attach_command(name: &str, replay: bool, resume: Option<String>) -
     let _raw_mode = RawModeGuard::enable(libc::STDIN_FILENO)?;
 
     if !replay {
-        try_attach(name, false, resume, false)?;
+        try_attach(name, false, resume, false, control)?;
         return Ok(());
     }
-    if try_attach(name, true, resume, false)? == Attachment::ReplayRejected {
+    if try_attach(name, true, resume, false, control)? == Attachment::ReplayRejected {
         // Masters started by an older build refuse a history larger than one
         // frame. Reaching a session without its scrollback beats refusing to
         // reach it at all, so drop the replay and attach again.
-        try_attach(name, false, None, false)?;
+        try_attach(name, false, None, false, control)?;
     }
     Ok(())
 }
@@ -265,8 +272,8 @@ pub(crate) fn attach_person(name: &str) -> io::Result<Ending> {
     install_attach_signal_handlers()?;
     let attachment = {
         let _raw_mode = RawModeGuard::enable(libc::STDIN_FILENO)?;
-        match try_attach(name, true, None, true)? {
-            Attachment::ReplayRejected => try_attach(name, false, None, true)?,
+        match try_attach(name, true, None, true, false)? {
+            Attachment::ReplayRejected => try_attach(name, false, None, true, false)?,
             other => other,
         }
     };
@@ -284,6 +291,7 @@ fn try_attach(
     replay: bool,
     resume: Option<OutputPosition>,
     detach_key: bool,
+    control: bool,
 ) -> io::Result<Attachment> {
     let size = terminal_size(libc::STDIN_FILENO);
     let mut stream = connect_or_create(name, size)?;
@@ -298,6 +306,10 @@ fn try_attach(
     }
     if let Some(position) = resume {
         send_frame(&mut stream, FRAME_RESUME, &position.encode())?;
+        optional_frames += 1;
+    }
+    if control {
+        send_frame(&mut stream, FRAME_CONTROL, &[CONTROL_JOIN])?;
         optional_frames += 1;
     }
     send_frame(&mut stream, FRAME_ATTACH, &encode_size(from_winsize(size)))?;
@@ -564,6 +576,9 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
             pty: Mutex::new(writer),
             clients: Mutex::new(HashMap::new()),
             away: Mutex::new(HashSet::new()),
+            devices: Mutex::new(HashMap::new()),
+            activity: Mutex::new(None),
+            went_quiet: Mutex::new(None),
             history: Mutex::new(history),
             notifications: Mutex::new(crate::relay::NotificationScanner::default()),
             relay: Mutex::new(crate::relay::Relay::default()),
@@ -593,6 +608,7 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
     };
 
     write_ready(ready_fd, true);
+    crate::presence::start_heartbeat();
     run_master(listener, reader, state);
 }
 
@@ -866,6 +882,13 @@ struct MasterState {
     /// Clients whose phone said it went to the background; see
     /// [`crate::FRAME_PRESENCE`].
     away: Mutex<HashSet<u64>>,
+    /// What each client said about its device, by client id.
+    devices: Mutex<HashMap<u64, String>>,
+    /// What the session is doing, as last worked out by `track_activity`.
+    activity: Mutex<Option<crate::Activity>>,
+    /// The program that last went quiet and how much output there was then;
+    /// still that program with no output since means it is waiting.
+    went_quiet: Mutex<Option<(i32, u64)>>,
     history: Mutex<History>,
     /// Watches the output for notifications a program asks for, so one sent
     /// while nobody is attached can still go out through the relay.
@@ -997,8 +1020,54 @@ impl MasterState {
         Ok(())
     }
 
+    /// Records which device client [id] is and reports it, so the user's
+    /// other devices see who is attached. Anything [`valid_device`] refuses
+    /// is ignored rather than failing the client.
+    fn device(&self, id: u64, payload: &[u8]) -> io::Result<()> {
+        if let Ok(description) = std::str::from_utf8(payload)
+            && crate::valid_device(description)
+        {
+            self.devices
+                .lock()
+                .expect("devices mutex poisoned")
+                .insert(id, description.to_owned());
+            crate::presence::report(None, false);
+            if self.holder_is_same_device(id, description) {
+                return self.take_control(id);
+            }
+            self.announce_control();
+        }
+        Ok(())
+    }
+
+    /// Whether the session is held by another connection of the device
+    /// that client [id] says it is: one that dropped off the network and
+    /// came back while its old connection still looks attached. That device
+    /// takes the session back rather than watching its own ghost.
+    fn holder_is_same_device(&self, id: u64, description: &str) -> bool {
+        let holder = self
+            .viewers
+            .lock()
+            .expect("viewers mutex poisoned")
+            .holder();
+        let Some(holder) = holder.filter(|&holder| holder != id) else {
+            return false;
+        };
+        self.devices
+            .lock()
+            .expect("devices mutex poisoned")
+            .get(&holder)
+            .is_some_and(|held| crate::same_device(held, description))
+    }
+
+    /// Forgets client [id] and reports the session without it - after it is
+    /// gone from the clients, or the report would still count it attached.
     fn remove_client(&self, id: u64) {
         self.away.lock().expect("away mutex poisoned").remove(&id);
+        self.devices
+            .lock()
+            .expect("devices mutex poisoned")
+            .remove(&id);
         let nobody_left = {
             let mut clients = self.clients.lock().expect("clients mutex poisoned");
             clients.remove(&id).is_some() && clients.is_empty()
@@ -1016,16 +1085,29 @@ impl MasterState {
             .left(id);
         if let Some(size) = back_to {
             let _ = self.resize(to_winsize(size));
+            self.announce_control();
         }
+        crate::presence::report(None, false);
     }
 
-    fn attached_at(&self, id: u64, size: TermSize) -> io::Result<()> {
-        let size = self
-            .viewers
-            .lock()
-            .expect("viewers mutex poisoned")
-            .attached(id, size);
-        self.resize(to_winsize(size)).map(|_| ())
+    /// Client [id] attached at [size]. One that [joined] control while
+    /// another client holds the session and is looking at it attaches as a
+    /// viewer and leaves the size alone.
+    fn attached_at(&self, id: u64, size: TermSize, joined: bool) -> io::Result<()> {
+        let apply = {
+            let away = self.away.lock().expect("away mutex poisoned");
+            let mut viewers = self.viewers.lock().expect("viewers mutex poisoned");
+            let held = viewers
+                .holder()
+                .is_some_and(|holder| holder != id && !away.contains(&holder));
+            viewers.attached(id, size, joined, held)
+        };
+        if let Some(size) = apply {
+            self.resize(to_winsize(size))?;
+        }
+        self.announce_control();
+        crate::presence::report(None, false);
+        Ok(())
     }
 
     fn resized_to(&self, id: u64, size: TermSize) -> io::Result<()> {
@@ -1035,19 +1117,74 @@ impl MasterState {
             .expect("viewers mutex poisoned")
             .resized(id, size);
         match apply {
-            Some(size) => self.resize(to_winsize(size)).map(|_| ()),
+            Some(size) => {
+                self.resize(to_winsize(size))?;
+                self.announce_control();
+                Ok(())
+            }
             None => Ok(()),
         }
     }
 
-    fn input_from(&self, id: u64, data: &[u8]) -> io::Result<()> {
+    /// Client [id] takes the session: its size is applied and every client
+    /// that follows control hears who holds it now.
+    fn take_control(&self, id: u64) -> io::Result<()> {
         let apply = self
             .viewers
             .lock()
             .expect("viewers mutex poisoned")
-            .typed(id);
+            .take(id);
         if let Some(size) = apply {
             self.resize(to_winsize(size))?;
+            self.announce_control();
+        }
+        Ok(())
+    }
+
+    /// Tells each client that joined control whether it holds the session,
+    /// the size the session runs at and which device holds it.
+    fn announce_control(&self) {
+        let (holder, size, joined) = {
+            let viewers = self.viewers.lock().expect("viewers mutex poisoned");
+            let (Some(holder), Some(size)) = (viewers.holder(), viewers.size()) else {
+                return;
+            };
+            (holder, size, viewers.joined().collect::<Vec<_>>())
+        };
+        if joined.is_empty() {
+            return;
+        }
+        let device = self
+            .devices
+            .lock()
+            .expect("devices mutex poisoned")
+            .get(&holder)
+            .cloned()
+            .unwrap_or_default();
+        let clients = self.clients.lock().expect("clients mutex poisoned");
+        for id in joined {
+            if let Some(channel) = clients.get(&id) {
+                let _ = channel.send(
+                    FRAME_CONTROL_STATE,
+                    &encode_control_state(id == holder, size, &device),
+                );
+            }
+        }
+    }
+
+    fn input_from(&self, id: u64, data: &[u8]) -> io::Result<()> {
+        let typed = self
+            .viewers
+            .lock()
+            .expect("viewers mutex poisoned")
+            .typed(id);
+        match typed {
+            Typed::Drop => return Ok(()),
+            Typed::Write(Some(size)) => {
+                self.resize(to_winsize(size))?;
+                self.announce_control();
+            }
+            Typed::Write(None) => {}
         }
         self.commands
             .lock()
@@ -1114,6 +1251,10 @@ impl MasterState {
                 .line
                 .as_deref()
                 .is_some_and(crate::relay::asks_something);
+            if asks || terminal_waits_for_keys(self) {
+                *self.went_quiet.lock().expect("went quiet mutex poisoned") =
+                    Some((quiet.group, writes));
+            }
             let seen = self
                 .watchers
                 .lock()
@@ -1126,6 +1267,46 @@ impl MasterState {
                     .announced(quiet.group, writes);
                 self.broadcast_output(&quiet.sequence());
             }
+        }
+        self.track_activity(group, writes, std::time::Instant::now());
+    }
+
+    /// Works out what the session is doing and reports it when that changed,
+    /// so the user's apps show it on the session's row.
+    fn track_activity(&self, group: i32, writes: u64, now: std::time::Instant) {
+        let activity = if group <= 0 || group == self.shell_pid {
+            crate::Activity {
+                state: crate::ActivityState::Idle,
+                command: None,
+            }
+        } else {
+            let working = self
+                .quiet
+                .lock()
+                .expect("quiet mutex poisoned")
+                .working(now);
+            let waiting = !working
+                && *self.went_quiet.lock().expect("went quiet mutex poisoned")
+                    == Some((group, writes));
+            crate::Activity {
+                state: if working {
+                    crate::ActivityState::Working
+                } else if waiting {
+                    crate::ActivityState::Waiting
+                } else {
+                    crate::ActivityState::Running
+                },
+                command: command_name(group),
+            }
+        };
+        let changed = {
+            let mut current = self.activity.lock().expect("activity mutex poisoned");
+            let changed = current.as_ref() != Some(&activity);
+            *current = Some(activity);
+            changed
+        };
+        if changed {
+            crate::presence::report(None, false);
         }
     }
 
@@ -1234,7 +1415,23 @@ impl MasterState {
     fn status(&self) -> String {
         let name = self.name.lock().expect("name mutex poisoned");
         let attached = self.clients.lock().expect("clients mutex poisoned").len();
-        format!("{name}\t1\t{}\t{attached}", self.created_at)
+        let devices = devices_field(
+            self.devices
+                .lock()
+                .expect("devices mutex poisoned")
+                .values(),
+        );
+        let activity = self
+            .activity
+            .lock()
+            .expect("activity mutex poisoned")
+            .as_ref()
+            .map(crate::Activity::field)
+            .unwrap_or_default();
+        format!(
+            "{name}\t1\t{}\t{attached}\t{devices}\t{activity}",
+            self.created_at
+        )
     }
 
     fn rename(&self, new_name: &str) -> io::Result<()> {
@@ -1262,6 +1459,7 @@ impl MasterState {
         fs::rename(&*directory, &destination)?;
         *directory = destination;
         *self.name.lock().expect("name mutex poisoned") = new_name.to_owned();
+        crate::presence::report(None, false);
         Ok(())
     }
 
@@ -1433,7 +1631,9 @@ impl MasterState {
             .lock()
             .expect("directory mutex poisoned")
             .clone();
+        let name = self.name.lock().expect("name mutex poisoned").clone();
         let _ = fs::remove_dir_all(directory);
+        crate::presence::report(Some(&name), true);
         process::exit(0)
     }
 }
@@ -1449,9 +1649,15 @@ fn client_loop(id: u64, mut stream: UnixStream, state: Arc<MasterState>) {
     let mut attached = false;
     let mut replay_requested = false;
     let mut resume_from = None;
+    let mut joined = false;
 
     while let Ok((kind, payload)) = read_frame(&mut stream) {
         let outcome = match kind {
+            FRAME_CONTROL if !attached && payload == [CONTROL_JOIN] => {
+                joined = true;
+                Ok(())
+            }
+            FRAME_CONTROL if attached && payload == [CONTROL_TAKE] => state.take_control(id),
             FRAME_HISTORY if !attached => {
                 replay_requested = true;
                 Ok(())
@@ -1472,10 +1678,11 @@ fn client_loop(id: u64, mut stream: UnixStream, state: Arc<MasterState>) {
                         size.rows,
                     )?;
                 }
-                state.attached_at(id, size)
+                state.attached_at(id, size, joined)
             }),
             FRAME_INPUT if attached => state.input_from(id, &payload),
             FRAME_PRESENCE if attached => state.presence(id, payload.first() == Some(&1)),
+            FRAME_DEVICE if attached => state.device(id, &payload),
             FRAME_RESIZE if attached => {
                 decode_size(&payload).and_then(|size| state.resized_to(id, size))
             }
@@ -1536,6 +1743,38 @@ fn sweep_abandoned_sessions(base: &Path) {
             let _ = fs::remove_dir_all(&path);
         }
     }
+}
+
+/// Session directories with no master answering on their socket - kept
+/// for restoring - and when each session was created.
+pub(crate) fn restorable_sessions() -> Vec<(String, u64)> {
+    let Ok(base) = base_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let mut restorable = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .filter(|entry| {
+            matches!(
+                probe_socket(&entry.path().join("control.sock")),
+                Probe::Absent
+            )
+        })
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            validate_name(&name).ok()?;
+            let created_at = fs::read_to_string(entry.path().join("created_at"))
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+                .unwrap_or(0);
+            Some((name, created_at))
+        })
+        .collect::<Vec<_>>();
+    restorable.sort();
+    restorable
 }
 
 pub(crate) fn list_command() -> io::Result<()> {
@@ -1660,8 +1899,18 @@ fn bridge_terminal(
                 return Ok(Attachment::Finished);
             }
             let (typed, moves) = presence.feed(&buffer[..count]);
-            for away in moves {
-                send_frame(&mut stream, FRAME_PRESENCE, &[u8::from(away)])?;
+            for event in moves {
+                match event {
+                    PresenceEvent::Away => send_frame(&mut stream, FRAME_PRESENCE, &[1])?,
+                    PresenceEvent::Back => send_frame(&mut stream, FRAME_PRESENCE, &[0])?,
+                    PresenceEvent::Device(description) => {
+                        send_frame(&mut stream, FRAME_DEVICE, description.as_bytes())?
+                    }
+                    PresenceEvent::TakeControl => {
+                        send_frame(&mut stream, FRAME_CONTROL, &[CONTROL_TAKE])?;
+                        tolerated_legacy_errors += 1;
+                    }
+                }
             }
             match detach_key.as_mut() {
                 None if typed.is_empty() => {}
@@ -1712,6 +1961,12 @@ fn bridge_terminal(
                     output.write_all(RESUME_END_MARKER)?;
                     write_offset(&mut output, &total)?;
                     output.flush()?;
+                }
+                (FRAME_CONTROL_STATE, payload) => {
+                    if let Some(marker) = control_marker(&payload) {
+                        output.write_all(&marker)?;
+                        output.flush()?;
+                    }
                 }
                 (FRAME_EXIT, _) => return Ok(Attachment::Finished),
                 (FRAME_ERROR, message) => {
@@ -1840,6 +2095,8 @@ fn spawn_persistence_thread(state: Arc<MasterState>) {
         loop {
             if MASTER_TERM_REQUESTED.load(Ordering::SeqCst) {
                 state.flush_restore_state(&mut last_cwd, true);
+                let name = state.name.lock().expect("name mutex poisoned").clone();
+                crate::presence::report_stopping(&name, state.created_at);
                 unsafe {
                     libc::_exit(0);
                 }
@@ -2053,6 +2310,9 @@ pub(crate) fn resume_master(args: Vec<String>) -> io::Result<()> {
         pty: Mutex::new(writer),
         clients: Mutex::new(HashMap::new()),
         away: Mutex::new(HashSet::new()),
+        devices: Mutex::new(HashMap::new()),
+        activity: Mutex::new(None),
+        went_quiet: Mutex::new(None),
         history: Mutex::new(history),
         notifications: Mutex::new(crate::relay::NotificationScanner::default()),
         relay: Mutex::new(crate::relay::Relay::default()),
@@ -2070,6 +2330,7 @@ pub(crate) fn resume_master(args: Vec<String>) -> io::Result<()> {
         upgrade_considered: Mutex::new(None),
     });
     spawn_persistence_thread(Arc::clone(&state));
+    crate::presence::start_heartbeat();
     run_master(listener, reader, state);
 }
 

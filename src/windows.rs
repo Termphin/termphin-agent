@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -61,12 +61,14 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::win32_codec::{CWD_PROMPT_HOOK, Win32InputDecoder, base64_utf16le};
 use crate::{
-    CLIENT_WRITE_TIMEOUT, ClientQueue, DetachKey, Ending, FRAME_ATTACH, FRAME_ERROR, FRAME_EXIT,
-    FRAME_HISTORY, FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_PRESENCE, FRAME_RENAME,
+    CLIENT_WRITE_TIMEOUT, CONTROL_JOIN, CONTROL_TAKE, ClientQueue, DetachKey, Ending, FRAME_ATTACH,
+    FRAME_CONTROL, FRAME_CONTROL_STATE, FRAME_DEVICE, FRAME_ERROR, FRAME_EXIT, FRAME_HISTORY,
+    FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_PRESENCE, FRAME_RENAME,
     FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_STATUS, FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT,
-    History, MAX_CLIENTS, PRESENCE_BACK_MARKER, PresenceKeys, REPLAY_CHUNK_SIZE, REPLAY_END_MARKER,
-    RestoreState, SCROLLBACK_FLUSH_EVERY_TICKS, SESSION_ENV, TermSize, Viewers, decode_size,
-    encode_size, invalid_input, read_frame, send_frame, strip_resize_reports, validate_name,
+    History, MAX_CLIENTS, PRESENCE_BACK_MARKER, PresenceEvent, PresenceKeys, REPLAY_CHUNK_SIZE,
+    REPLAY_END_MARKER, RestoreState, SCROLLBACK_FLUSH_EVERY_TICKS, SESSION_ENV, TermSize, Typed,
+    Viewers, control_marker, decode_size, devices_field, encode_control_state, encode_size,
+    invalid_input, read_frame, send_frame, strip_resize_reports, validate_name,
 };
 
 /// Ten cheap console reads a second, against a visible lag on every rotation
@@ -911,6 +913,8 @@ struct MasterState {
     /// Clients whose phone said it went to the background; see
     /// [`crate::FRAME_PRESENCE`].
     away: Mutex<HashSet<u64>>,
+    /// What each client said about its device, by client id.
+    devices: Mutex<HashMap<u64, String>>,
     history: Mutex<History>,
     viewers: Mutex<Viewers>,
     size: Mutex<TermSize>,
@@ -994,8 +998,54 @@ impl MasterState {
         Ok(())
     }
 
+    /// Records which device client [id] is and reports it, so the user's
+    /// other devices see who is attached. Anything [`valid_device`] refuses
+    /// is ignored rather than failing the client.
+    fn device(&self, id: u64, payload: &[u8]) -> io::Result<()> {
+        if let Ok(description) = std::str::from_utf8(payload)
+            && crate::valid_device(description)
+        {
+            self.devices
+                .lock()
+                .expect("devices mutex poisoned")
+                .insert(id, description.to_owned());
+            crate::presence::report(None, false);
+            if self.holder_is_same_device(id, description) {
+                return self.take_control(id);
+            }
+            self.announce_control();
+        }
+        Ok(())
+    }
+
+    /// Whether the session is held by another connection of the device
+    /// that client [id] says it is: one that dropped off the network and
+    /// came back while its old connection still looks attached. That device
+    /// takes the session back rather than watching its own ghost.
+    fn holder_is_same_device(&self, id: u64, description: &str) -> bool {
+        let holder = self
+            .viewers
+            .lock()
+            .expect("viewers mutex poisoned")
+            .holder();
+        let Some(holder) = holder.filter(|&holder| holder != id) else {
+            return false;
+        };
+        self.devices
+            .lock()
+            .expect("devices mutex poisoned")
+            .get(&holder)
+            .is_some_and(|held| crate::same_device(held, description))
+    }
+
+    /// Forgets client [id] and reports the session without it - after it is
+    /// gone from the clients, or the report would still count it attached.
     fn remove_client(&self, id: u64) {
         self.away.lock().expect("away mutex poisoned").remove(&id);
+        self.devices
+            .lock()
+            .expect("devices mutex poisoned")
+            .remove(&id);
         let nobody_left = {
             let mut clients = self.clients.lock().expect("clients mutex poisoned");
             clients.remove(&id).is_some() && clients.is_empty()
@@ -1013,16 +1063,28 @@ impl MasterState {
             .left(id);
         if let Some(size) = back_to {
             let _ = self.resize(size);
+            self.announce_control();
         }
+        crate::presence::report(None, false);
     }
 
-    fn attached_at(&self, id: u64, size: TermSize) -> io::Result<()> {
-        let size = self
-            .viewers
-            .lock()
-            .expect("viewers mutex poisoned")
-            .attached(id, size);
-        self.resize(size).map(|_| ())
+    /// As on Unix: a client that [joined] control attaches as a viewer
+    /// while another holds the session and is looking at it.
+    fn attached_at(&self, id: u64, size: TermSize, joined: bool) -> io::Result<()> {
+        let apply = {
+            let away = self.away.lock().expect("away mutex poisoned");
+            let mut viewers = self.viewers.lock().expect("viewers mutex poisoned");
+            let held = viewers
+                .holder()
+                .is_some_and(|holder| holder != id && !away.contains(&holder));
+            viewers.attached(id, size, joined, held)
+        };
+        if let Some(size) = apply {
+            self.resize(size)?;
+        }
+        self.announce_control();
+        crate::presence::report(None, false);
+        Ok(())
     }
 
     fn resized_to(&self, id: u64, size: TermSize) -> io::Result<()> {
@@ -1032,19 +1094,72 @@ impl MasterState {
             .expect("viewers mutex poisoned")
             .resized(id, size);
         match apply {
-            Some(size) => self.resize(size).map(|_| ()),
+            Some(size) => {
+                self.resize(size)?;
+                self.announce_control();
+                Ok(())
+            }
             None => Ok(()),
         }
     }
 
-    fn input_from(&self, id: u64, data: &[u8]) -> io::Result<()> {
+    fn take_control(&self, id: u64) -> io::Result<()> {
         let apply = self
             .viewers
             .lock()
             .expect("viewers mutex poisoned")
-            .typed(id);
+            .take(id);
         if let Some(size) = apply {
             self.resize(size)?;
+            self.announce_control();
+        }
+        Ok(())
+    }
+
+    /// Tells each client that joined control whether it holds the session,
+    /// the size the session runs at and which device holds it.
+    fn announce_control(&self) {
+        let (holder, size, joined) = {
+            let viewers = self.viewers.lock().expect("viewers mutex poisoned");
+            let (Some(holder), Some(size)) = (viewers.holder(), viewers.size()) else {
+                return;
+            };
+            (holder, size, viewers.joined().collect::<Vec<_>>())
+        };
+        if joined.is_empty() {
+            return;
+        }
+        let device = self
+            .devices
+            .lock()
+            .expect("devices mutex poisoned")
+            .get(&holder)
+            .cloned()
+            .unwrap_or_default();
+        let clients = self.clients.lock().expect("clients mutex poisoned");
+        for id in joined {
+            if let Some(channel) = clients.get(&id) {
+                let _ = channel.send(
+                    FRAME_CONTROL_STATE,
+                    &encode_control_state(id == holder, size, &device),
+                );
+            }
+        }
+    }
+
+    fn input_from(&self, id: u64, data: &[u8]) -> io::Result<()> {
+        let typed = self
+            .viewers
+            .lock()
+            .expect("viewers mutex poisoned")
+            .typed(id);
+        match typed {
+            Typed::Drop => return Ok(()),
+            Typed::Write(Some(size)) => {
+                self.resize(size)?;
+                self.announce_control();
+            }
+            Typed::Write(None) => {}
         }
         self.commands
             .lock()
@@ -1225,7 +1340,13 @@ impl MasterState {
     fn status(&self) -> String {
         let name = self.name.lock().expect("name mutex poisoned");
         let attached = self.clients.lock().expect("clients mutex poisoned").len();
-        format!("{name}\t1\t{}\t{attached}", self.created_at)
+        let devices = devices_field(
+            self.devices
+                .lock()
+                .expect("devices mutex poisoned")
+                .values(),
+        );
+        format!("{name}\t1\t{}\t{attached}\t{devices}", self.created_at)
     }
 
     fn rename(&self, new_name: &str) -> io::Result<()> {
@@ -1255,6 +1376,7 @@ impl MasterState {
                 CancelIoEx(handle.0, std::ptr::null());
             }
         }
+        crate::presence::report(None, false);
         Ok(())
     }
 
@@ -1326,7 +1448,9 @@ impl MasterState {
             .lock()
             .expect("directory mutex poisoned")
             .clone();
+        let name = self.name.lock().expect("name mutex poisoned").clone();
         let _ = std::fs::remove_dir_all(directory);
+        crate::presence::report(Some(&name), true);
         std::process::exit(0)
     }
 }
@@ -1336,6 +1460,7 @@ fn client_loop(id: u64, pipe: AsyncPipe, state: Arc<MasterState>) {
     let handshake_ms = Some(HANDSHAKE_TIMEOUT.as_millis() as u32);
     let mut attached = false;
     let mut replay_requested = false;
+    let mut joined = false;
 
     loop {
         let timeout = if attached { None } else { handshake_ms };
@@ -1343,6 +1468,11 @@ fn client_loop(id: u64, pipe: AsyncPipe, state: Arc<MasterState>) {
             break;
         };
         let outcome = match kind {
+            FRAME_CONTROL if !attached && payload == [CONTROL_JOIN] => {
+                joined = true;
+                Ok(())
+            }
+            FRAME_CONTROL if attached && payload == [CONTROL_TAKE] => state.take_control(id),
             FRAME_HISTORY if !attached => {
                 replay_requested = true;
                 Ok(())
@@ -1352,10 +1482,11 @@ fn client_loop(id: u64, pipe: AsyncPipe, state: Arc<MasterState>) {
                     attached = true;
                     state.add_client(id, Arc::clone(&writer), replay_requested, size.rows)?;
                 }
-                state.attached_at(id, size)
+                state.attached_at(id, size, joined)
             }),
             FRAME_INPUT if attached => state.input_from(id, &payload),
             FRAME_PRESENCE if attached => state.presence(id, payload.first() == Some(&1)),
+            FRAME_DEVICE if attached => state.device(id, &payload),
             FRAME_RESIZE if attached => {
                 decode_size(&payload).and_then(|size| state.resized_to(id, size))
             }
@@ -1471,6 +1602,7 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
         pty_write: Mutex::new(pty_write),
         clients: Mutex::new(HashMap::new()),
         away: Mutex::new(HashSet::new()),
+        devices: Mutex::new(HashMap::new()),
         history: Mutex::new(history),
         viewers: Mutex::new(Viewers::default()),
         size: Mutex::new(size),
@@ -1497,6 +1629,7 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
         }
         reader_state.finish();
     });
+    crate::presence::start_heartbeat();
 
     // ConPTY holds its output pipe open after the shell exits, until it is
     // closed - so without this an `exit` would leave the session listed, and
@@ -1710,6 +1843,11 @@ fn sweep_abandoned_sessions(base: &std::path::Path) {
     }
 }
 
+/// Restoring after a reboot is not reported on Windows yet.
+pub(crate) fn restorable_sessions() -> Vec<(String, u64)> {
+    Vec::new()
+}
+
 pub(crate) fn list_command() -> io::Result<()> {
     for status in session_statuses()? {
         println!("{status}");
@@ -1767,15 +1905,20 @@ fn control_command(name: &str, kind: u8, payload: &[u8]) -> io::Result<()> {
 /// `_resume` is not honoured here: ConPTY re-renders the output, so the
 /// bytes a client receives are not the bytes an offset counts. A resume asked
 /// for gets the replay, which is what the app falls back to anyway.
-pub(crate) fn attach_command(name: &str, replay: bool, _resume: Option<String>) -> io::Result<()> {
+pub(crate) fn attach_command(
+    name: &str,
+    replay: bool,
+    _resume: Option<String>,
+    control: bool,
+) -> io::Result<()> {
     let _raw_mode = ConsoleRawMode::enable()?;
 
     if !replay {
-        try_attach(name, false, false)?;
+        try_attach(name, false, false, control)?;
         return Ok(());
     }
-    if try_attach(name, true, false)? == Attachment::ReplayRejected {
-        try_attach(name, false, false)?;
+    if try_attach(name, true, false, control)? == Attachment::ReplayRejected {
+        try_attach(name, false, false, control)?;
     }
     Ok(())
 }
@@ -1788,8 +1931,8 @@ const RESET_ON_DETACH: &[u8] =
 
 pub(crate) fn attach_person(name: &str) -> io::Result<Ending> {
     let _raw_mode = ConsoleRawMode::enable()?;
-    let attachment = match try_attach(name, true, true)? {
-        Attachment::ReplayRejected => try_attach(name, false, true)?,
+    let attachment = match try_attach(name, true, true, false)? {
+        Attachment::ReplayRejected => try_attach(name, false, true, false)?,
         other => other,
     };
     // Still in VT mode: restored, the console would print these as text.
@@ -1820,14 +1963,17 @@ fn console_size() -> TermSize {
     TermSize { cols: 80, rows: 24 }
 }
 
-fn try_attach(name: &str, replay: bool, detach_key: bool) -> io::Result<Attachment> {
+fn try_attach(name: &str, replay: bool, detach_key: bool, control: bool) -> io::Result<Attachment> {
     let size = console_size();
     let pipe = connect_or_create(name, size)?;
     if replay {
         send_frame(&mut &pipe, FRAME_HISTORY, &[])?;
     }
+    if control {
+        send_frame(&mut &pipe, FRAME_CONTROL, &[CONTROL_JOIN])?;
+    }
     send_frame(&mut &pipe, FRAME_ATTACH, &encode_size(size))?;
-    bridge_terminal(pipe, size, replay, detach_key)
+    bridge_terminal(pipe, size, replay, detach_key, usize::from(control))
 }
 
 impl Read for &AsyncPipe {
@@ -1852,9 +1998,16 @@ fn bridge_terminal(
     initial_size: TermSize,
     replay_requested: bool,
     detach_key: bool,
+    optional_frames: usize,
 ) -> io::Result<Attachment> {
     let pipe = Arc::new(pipe);
     let input_pipe = Arc::clone(&pipe);
+    // Older masters answer each optional frame with an error and go on; one
+    // such error is let through per frame sent, from either thread.
+    let tolerated = Arc::new(AtomicUsize::new(
+        optional_frames + usize::from(replay_requested),
+    ));
+    let input_tolerated = Arc::clone(&tolerated);
     let detached = Arc::new(AtomicBool::new(false));
     let input_detached = Arc::clone(&detached);
     let mut detach_key = detach_key.then(DetachKey::default);
@@ -1883,8 +2036,19 @@ fn bridge_terminal(
                 return;
             }
             let (decoded, moves) = presence.feed(&win32_input.feed(&buffer[..read as usize]));
-            for away in moves {
-                if send_frame(&mut &*input_pipe, FRAME_PRESENCE, &[u8::from(away)]).is_err() {
+            for event in moves {
+                let sent = match event {
+                    PresenceEvent::Away => send_frame(&mut &*input_pipe, FRAME_PRESENCE, &[1]),
+                    PresenceEvent::Back => send_frame(&mut &*input_pipe, FRAME_PRESENCE, &[0]),
+                    PresenceEvent::Device(description) => {
+                        send_frame(&mut &*input_pipe, FRAME_DEVICE, description.as_bytes())
+                    }
+                    PresenceEvent::TakeControl => {
+                        input_tolerated.fetch_add(1, Ordering::SeqCst);
+                        send_frame(&mut &*input_pipe, FRAME_CONTROL, &[CONTROL_TAKE])
+                    }
+                };
+                if sent.is_err() {
                     return;
                 }
             }
@@ -1924,7 +2088,6 @@ fn bridge_terminal(
     });
 
     let mut output = io::stdout().lock();
-    let mut tolerate_legacy_replay_error = replay_requested;
     let mut painted = false;
 
     loop {
@@ -1944,13 +2107,24 @@ fn bridge_terminal(
                 output.write_all(REPLAY_END_MARKER)?;
                 output.flush()?;
             }
+            (FRAME_CONTROL_STATE, payload) => {
+                if let Some(marker) = control_marker(&payload) {
+                    output.write_all(&marker)?;
+                    output.flush()?;
+                }
+            }
             (FRAME_EXIT, _) => return Ok(Attachment::Finished),
             (FRAME_STATUS_RESPONSE, _) if detached.load(Ordering::SeqCst) => {
                 return Ok(Attachment::Detached);
             }
             (FRAME_ERROR, message) => {
-                if tolerate_legacy_replay_error && message.as_slice() == b"invalid protocol frame" {
-                    tolerate_legacy_replay_error = false;
+                if message.as_slice() == b"invalid protocol frame"
+                    && tolerated
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                            left.checked_sub(1)
+                        })
+                        .is_ok()
+                {
                     continue;
                 }
                 if replay_requested && !painted {

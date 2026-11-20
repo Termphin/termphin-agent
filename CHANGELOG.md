@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.20.0 - 2026-11-20
+
+- With live presence set up by the app, each session reports the server's sessions - sealed with a key only the user's devices hold - when it starts, every five minutes and when it ends, so the apps show them without connecting. `termphin-agent presence` sends one report; the app runs it from the user's crontab every five minutes and at boot, so a machine without sessions shows as online too. Renaming a session reports at once.
+- An app can say which device it is when it attaches (`OSC 5386;device;…`); the session lists the devices attached to it as a fifth field of `list` and in its presence reports, which are sent as soon as a device attaches or leaves.
+- The presence report says what each session is doing - idle at the prompt, working, waiting for an answer, or running quietly - and names the program the way notifications do; on Linux and macOS.
+- Sessions stopped by a reboot or a signal are reported as restorable, so the apps keep them; a session stopped while the system shuts down, or the last one left, reports the machine offline at once (best effort, two seconds).
+- A relay file ending in `quiet` keeps the key for live status but sends no notification, for machines whose notifications are off.
+- Control: an app that attaches with `--control` joins as a viewer while another device holds the session, leaving its size alone, and takes the session only when it asks (`OSC 5386;control;take`). Each such app is told whether it holds the session, the size the session runs at and which device holds it. Older apps keep taking the session by attaching or typing, as before.
+
 ## 0.18.1 - 2026-11-16
 
 - A phone that comes back to a session is shown it at its own size. A line that wrapped across the top of the screen is no longer torn in two, a phone shorter than the screen was (its keyboard open) no longer gets a run of empty lines in the middle of the output, and a taller one no longer loses the lines that were just above the screen.

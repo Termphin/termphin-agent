@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{Arc, Mutex};
 
+mod presence;
 mod relay;
 #[cfg(unix)]
 mod unix;
@@ -49,6 +50,18 @@ pub(crate) const FRAME_RESUME: u8 = 8;
 /// would still look attached; while every client is away, notifications go
 /// to the relay as they would with none attached.
 pub(crate) const FRAME_PRESENCE: u8 = 9;
+/// Which device a client is: what the app said in [`PRESENCE_DEVICE`],
+/// checked by [`valid_device`]. Only sent to a master from 0.20.0 on, which
+/// the app knows from the master's version marker.
+pub(crate) const FRAME_DEVICE: u8 = 10;
+/// Who types into the session. Payload [`CONTROL_JOIN`] before
+/// FRAME_ATTACH says the client follows control: it attaches as a viewer
+/// while another client holds the session, and what it types is dropped
+/// until it takes control. [`CONTROL_TAKE`] after FRAME_ATTACH takes it.
+/// Older masters answer both with an error the client tolerates.
+pub(crate) const FRAME_CONTROL: u8 = 11;
+pub(crate) const CONTROL_JOIN: u8 = 0;
+pub(crate) const CONTROL_TAKE: u8 = 1;
 
 pub(crate) const FRAME_OUTPUT: u8 = 101;
 pub(crate) const FRAME_STATUS_RESPONSE: u8 = 102;
@@ -63,6 +76,10 @@ pub(crate) const FRAME_REPLAY_DONE: u8 = 106;
 /// from.
 #[cfg(unix)]
 pub(crate) const FRAME_RESUME_DONE: u8 = 107;
+/// Master to a client that joined control: whether it holds the session,
+/// the size the session runs at, and the controlling client's device
+/// description when it gave one. See [`ControlState`].
+pub(crate) const FRAME_CONTROL_STATE: u8 = 108;
 
 pub(crate) const REPLAY_END_MARKER: &[u8] = b"\x1b]5380;termphin-replay-end\x07";
 pub(crate) const REBOOT_RESTORED_MARKER: &[u8] = b"\x1b]5381;termphin-reboot-restored\x07";
@@ -290,6 +307,8 @@ usage: termphin <command>
   kill <name>           end a session
   notify [title] [body] show a notification in Termphin (or any terminal that
                         reads OSC 777), e.g. at the end of a long command
+  presence              tell the user's apps this machine is online, with its
+                        sessions (run from crontab by the app)
   version               print the version
 
 Detach with Ctrl-\\ then d. Ctrl-\\ twice sends it to the program.
@@ -304,9 +323,11 @@ fn run() -> io::Result<()> {
         "attach" | "a" => {
             let mut replay = false;
             let mut resume = None;
+            let mut control = false;
             let name = loop {
                 match args.next().as_deref() {
                     Some("--replay") => replay = true,
+                    Some("--control") => control = true,
                     // Only read as a string here: positions are a Unix notion,
                     // and Windows takes the flag without acting on it.
                     Some("--resume") => {
@@ -320,8 +341,8 @@ fn run() -> io::Result<()> {
             };
             // The app always passes a flag; a bare attach is a person at a
             // terminal, who gets the replay, a detach key and a choice.
-            if replay || resume.is_some() {
-                platform::attach_command(&required_name(name)?, replay, resume)?;
+            if replay || resume.is_some() || control {
+                platform::attach_command(&required_name(name)?, replay, resume, control)?;
             } else {
                 attach_person(name)?;
             }
@@ -336,6 +357,7 @@ fn run() -> io::Result<()> {
         }
         "kill" => platform::kill_command(&required_name(args.next())?)?,
         "notify" => notify_command(args.next(), args.collect::<Vec<_>>().join(" "))?,
+        "presence" => presence::report(None, true),
         // Internal re-exec target used to detach the session master from the
         // process that spawned it. Not part of the public CLI.
         #[cfg(windows)]
@@ -445,7 +467,14 @@ pub(crate) enum Ending {
     Ended,
 }
 
-fn sessions() -> io::Result<Vec<SessionInfo>> {
+/// Sessions whose process is gone but whose directory is kept - stopped by
+/// a reboot or a signal - with their creation time: attaching to one
+/// restores its screen and working directory.
+pub(crate) fn restorable_sessions() -> Vec<(String, u64)> {
+    platform::restorable_sessions()
+}
+
+pub(crate) fn sessions() -> io::Result<Vec<SessionInfo>> {
     Ok(platform::session_statuses()?
         .iter()
         .filter_map(|status| SessionInfo::parse(status))
@@ -508,13 +537,90 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// One line of `list`: name, protocol, creation time in Unix seconds and the
-/// number of clients attached.
+/// One line of `list`: name, protocol, creation time in Unix seconds, the
+/// number of clients attached and - from 0.20.0, as a fifth field - the
+/// devices of those clients that said which they are, comma-separated.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SessionInfo {
     pub(crate) name: String,
     pub(crate) created_at: u64,
     pub(crate) clients: usize,
+    pub(crate) devices: Vec<String>,
+    pub(crate) activity: Option<Activity>,
+}
+
+/// What a session is doing, as its master sees it every few seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActivityState {
+    /// The shell has the terminal: nothing is running.
+    Idle,
+    /// A program has the terminal and wrote something in the last seconds.
+    Working,
+    /// A program worked, went still and is waiting for keys or asking
+    /// something - what the "quiet" notification announces.
+    Waiting,
+    /// A program has the terminal and is none of the above.
+    Running,
+}
+
+impl ActivityState {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Waiting => "waiting",
+            Self::Running => "running",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "idle" => Self::Idle,
+            "working" => Self::Working,
+            "waiting" => Self::Waiting,
+            "running" => Self::Running,
+            _ => return None,
+        })
+    }
+}
+
+/// A session's activity: its state and the program in front, named the
+/// way notifications name it - the program and the words before its first
+/// option, so nothing typed after an option, a password say, ever shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Activity {
+    pub(crate) state: ActivityState,
+    pub(crate) command: Option<String>,
+}
+
+impl Activity {
+    /// The sixth field of a status line: the state, then `;` and the
+    /// command in URL-safe base64 when there is one.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn field(&self) -> String {
+        match &self.command {
+            Some(command) => format!(
+                "{};{}",
+                self.state.as_str(),
+                presence::encode_base64url(command.as_bytes())
+            ),
+            None => self.state.as_str().to_owned(),
+        }
+    }
+
+    pub(crate) fn parse(field: &str) -> Option<Self> {
+        let (state, command) = match field.split_once(';') {
+            Some((state, encoded)) => (
+                state,
+                Some(String::from_utf8(presence::decode_base64url(encoded)?).ok()?),
+            ),
+            None => (field, None),
+        };
+        Some(Self {
+            state: ActivityState::parse(state)?,
+            command,
+        })
+    }
 }
 
 impl SessionInfo {
@@ -524,10 +630,23 @@ impl SessionInfo {
         let _protocol = fields.next()?;
         let created_at = fields.next()?.parse().ok()?;
         let clients = fields.next()?.parse().ok()?;
+        let devices = fields
+            .next()
+            .map(|field| {
+                field
+                    .split(',')
+                    .filter(|device| valid_device(device))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let activity = fields.next().and_then(Activity::parse);
         Some(Self {
             name,
             created_at,
             clients,
+            devices,
+            activity,
         })
     }
 }
@@ -625,6 +744,59 @@ pub(crate) fn anyone_present<'a>(
     clients.into_iter().any(|id| !away.contains(id))
 }
 
+/// The fifth field of a status line: the attached devices that said which
+/// they are, comma-separated.
+pub(crate) fn devices_field<'a>(devices: impl IntoIterator<Item = &'a String>) -> String {
+    devices
+        .into_iter()
+        .filter(|device| valid_device(device))
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// What the app types to say which device it is, followed by the device's
+/// description and `BEL`: `<install id>;<kind>;<base64url name>`. The agent
+/// keeps it opaque and passes it on in its presence reports, so the user's
+/// other devices can show who is attached to a session.
+pub(crate) const PRESENCE_DEVICE: &[u8] = b"\x1b]5386;device;";
+
+/// Longest device description kept.
+const MAX_DEVICE: usize = 200;
+
+/// Whether [description] is something the app could have sent: a short run
+/// of URL-safe base64 characters and the `;` between its fields - never a
+/// tab, comma or quote that would break the status line or a report.
+pub(crate) fn valid_device(description: &str) -> bool {
+    !description.is_empty()
+        && description.len() <= MAX_DEVICE
+        && description
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b';'))
+}
+
+/// What the app types to take control of the session; see
+/// [`FRAME_CONTROL`].
+pub(crate) const CONTROL_TAKE_KEYS: &[u8] = b"\x1b]5386;control;take\x07";
+
+/// Whether two device descriptions name the same device: the same install
+/// id, the first field, whatever its name now says.
+pub(crate) fn same_device(a: &str, b: &str) -> bool {
+    match (a.split(';').next(), b.split(';').next()) {
+        (Some(first), Some(second)) => !first.is_empty() && first == second,
+        _ => false,
+    }
+}
+
+/// A message the app typed that is not for the shell.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PresenceEvent {
+    Away,
+    Back,
+    Device(String),
+    TakeControl,
+}
+
 /// Takes the app's presence messages out of what is typed, the way
 /// [`DetachKey`] takes the detach key out.
 #[derive(Default)]
@@ -633,12 +805,13 @@ pub(crate) struct PresenceKeys {
 }
 
 impl PresenceKeys {
-    /// The input to send on, and the presence messages found in it in order:
-    /// `true` for away, `false` for back.
+    /// The input to send on, and the presence messages found in it in order.
     ///
     /// A message cut off at the end of a read is held for the next one. Only
-    /// from `ESC ]` on, so an Escape pressed on its own is never held back.
-    pub(crate) fn feed(&mut self, input: &[u8]) -> (Vec<u8>, Vec<bool>) {
+    /// from `ESC ]` on, so an Escape pressed on its own is never held back,
+    /// and a device message only up to [`MAX_DEVICE`]: anything longer was
+    /// not the app's and goes to the shell as typed.
+    pub(crate) fn feed(&mut self, input: &[u8]) -> (Vec<u8>, Vec<PresenceEvent>) {
         let mut data = std::mem::take(&mut self.pending);
         data.extend_from_slice(input);
         let mut forward = Vec::with_capacity(data.len());
@@ -647,18 +820,43 @@ impl PresenceKeys {
         while index < data.len() {
             let rest = &data[index..];
             if rest.starts_with(PRESENCE_AWAY) {
-                events.push(true);
+                events.push(PresenceEvent::Away);
                 index += PRESENCE_AWAY.len();
                 continue;
             }
             if rest.starts_with(PRESENCE_BACK) {
-                events.push(false);
+                events.push(PresenceEvent::Back);
                 index += PRESENCE_BACK.len();
                 continue;
             }
+            if rest.starts_with(CONTROL_TAKE_KEYS) {
+                events.push(PresenceEvent::TakeControl);
+                index += CONTROL_TAKE_KEYS.len();
+                continue;
+            }
+            if rest.starts_with(PRESENCE_DEVICE) {
+                let body = &rest[PRESENCE_DEVICE.len()..];
+                let limit = body.len().min(MAX_DEVICE + 1);
+                if let Some(end) = body[..limit].iter().position(|&byte| byte == 0x07) {
+                    if let Ok(description) = std::str::from_utf8(&body[..end])
+                        && valid_device(description)
+                    {
+                        events.push(PresenceEvent::Device(description.to_owned()));
+                    }
+                    index += PRESENCE_DEVICE.len() + end + 1;
+                    continue;
+                }
+                if body.len() <= MAX_DEVICE {
+                    self.pending = rest.to_vec();
+                    break;
+                }
+            }
             if rest.len() >= 2
                 && rest[0] == 0x1b
-                && (PRESENCE_AWAY.starts_with(rest) || PRESENCE_BACK.starts_with(rest))
+                && (PRESENCE_AWAY.starts_with(rest)
+                    || PRESENCE_BACK.starts_with(rest)
+                    || PRESENCE_DEVICE.starts_with(rest)
+                    || CONTROL_TAKE_KEYS.starts_with(rest))
             {
                 self.pending = rest.to_vec();
                 break;
@@ -706,53 +904,150 @@ fn resize_report_at(data: &[u8]) -> Option<usize> {
     Some(b"\x1b[8;".len() + rows + 1 + cols + 1)
 }
 
-/// Whose size the session's terminal takes: the client that last attached
-/// or typed. Two clients of different sizes cannot both be right, and the
-/// one in use is the one worth being right for.
+/// Who holds the session and whose size its terminal takes.
+///
+/// A client that joined control ([`FRAME_CONTROL`]) attaches as a viewer
+/// while another client holds the session and is not away, and only takes
+/// it with [`CONTROL_TAKE`]; what it types meanwhile is dropped. A client
+/// that never joined is an older app, and gets what every client had
+/// before: attaching or typing makes it the one whose size is used.
+/// When the holder leaves, the client used most recently before it takes
+/// over.
 #[derive(Default)]
 pub(crate) struct Viewers {
-    recent: Vec<(u64, TermSize)>,
+    recent: Vec<Viewer>,
+    holder: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct Viewer {
+    id: u64,
+    size: TermSize,
+    joined: bool,
+}
+
+/// What to do with input a client typed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Typed {
+    /// Write it, after resizing to this size if there is one.
+    Write(Option<TermSize>),
+    /// Drop it: the client follows control and does not hold the session.
+    Drop,
 }
 
 impl Viewers {
-    pub(crate) fn attached(&mut self, id: u64, size: TermSize) -> TermSize {
-        self.recent.retain(|(client, _)| *client != id);
-        self.recent.push((id, size));
-        size
-    }
-
-    /// The size to apply, if the client that resized is the one in use.
-    pub(crate) fn resized(&mut self, id: u64, size: TermSize) -> Option<TermSize> {
-        let entry = self.recent.iter_mut().find(|(client, _)| *client == id)?;
-        entry.1 = size;
-        self.is_active(id).then_some(size)
-    }
-
-    /// The size to apply, if typing made this client the one in use.
-    pub(crate) fn typed(&mut self, id: u64) -> Option<TermSize> {
-        if self.is_active(id) {
+    /// Client [id] attached at [size]. [held] says whether another client
+    /// holds the session and is not away. The size to apply, if the client
+    /// now holds the session.
+    pub(crate) fn attached(
+        &mut self,
+        id: u64,
+        size: TermSize,
+        joined: bool,
+        held: bool,
+    ) -> Option<TermSize> {
+        self.recent.retain(|viewer| viewer.id != id);
+        self.recent.push(Viewer { id, size, joined });
+        if joined && held && self.holder.is_some_and(|holder| holder != id) {
             return None;
         }
-        let index = self.recent.iter().position(|(client, _)| *client == id)?;
-        let entry = self.recent.remove(index);
-        self.recent.push(entry);
-        Some(entry.1)
+        self.holder = Some(id);
+        Some(size)
     }
 
-    /// The size to go back to, if the client in use left.
-    pub(crate) fn left(&mut self, id: u64) -> Option<TermSize> {
-        let was_active = self.is_active(id);
-        self.recent.retain(|(client, _)| *client != id);
-        if was_active {
-            self.recent.last().map(|(_, size)| *size)
-        } else {
-            None
+    /// The size to apply, if the client that resized holds the session.
+    pub(crate) fn resized(&mut self, id: u64, size: TermSize) -> Option<TermSize> {
+        let viewer = self.recent.iter_mut().find(|viewer| viewer.id == id)?;
+        viewer.size = size;
+        (self.holder == Some(id)).then_some(size)
+    }
+
+    pub(crate) fn typed(&mut self, id: u64) -> Typed {
+        if self.holder == Some(id) {
+            return Typed::Write(None);
+        }
+        match self.recent.iter().find(|viewer| viewer.id == id) {
+            Some(viewer) if viewer.joined => Typed::Drop,
+            Some(_) => Typed::Write(self.take(id)),
+            None => Typed::Write(None),
         }
     }
 
-    fn is_active(&self, id: u64) -> bool {
-        self.recent.last().is_some_and(|(client, _)| *client == id)
+    /// Client [id] takes the session. Its size, if that changed hands.
+    pub(crate) fn take(&mut self, id: u64) -> Option<TermSize> {
+        if self.holder == Some(id) {
+            return None;
+        }
+        let index = self.recent.iter().position(|viewer| viewer.id == id)?;
+        let viewer = self.recent.remove(index);
+        self.recent.push(viewer);
+        self.holder = Some(id);
+        Some(viewer.size)
     }
+
+    /// The size to go back to, if the client that left held the session.
+    pub(crate) fn left(&mut self, id: u64) -> Option<TermSize> {
+        self.recent.retain(|viewer| viewer.id != id);
+        if self.holder != Some(id) {
+            return None;
+        }
+        let next = self.recent.last().copied();
+        self.holder = next.map(|viewer| viewer.id);
+        next.map(|viewer| viewer.size)
+    }
+
+    pub(crate) fn holder(&self) -> Option<u64> {
+        self.holder
+    }
+
+    /// The size the session runs at: the holder's.
+    pub(crate) fn size(&self) -> Option<TermSize> {
+        let holder = self.holder?;
+        self.recent
+            .iter()
+            .find(|viewer| viewer.id == holder)
+            .map(|viewer| viewer.size)
+    }
+
+    /// The clients that joined control, which are told who holds it.
+    pub(crate) fn joined(&self) -> impl Iterator<Item = u64> + '_ {
+        self.recent
+            .iter()
+            .filter(|viewer| viewer.joined)
+            .map(|viewer| viewer.id)
+    }
+}
+
+/// What [`FRAME_CONTROL_STATE`] carries: one byte, 1 when the client it is
+/// sent to holds the session; the session's size as in [`encode_size`];
+/// then the holder's device description, empty when it gave none.
+pub(crate) fn encode_control_state(holds: bool, size: TermSize, device: &str) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(9 + device.len());
+    payload.push(u8::from(holds));
+    payload.extend_from_slice(&encode_size(size));
+    payload.extend_from_slice(device.as_bytes());
+    payload
+}
+
+/// The marker a client writes for the app on [`FRAME_CONTROL_STATE`]:
+/// `ESC ] 5384 ; termphin-control ; <you|other> ; <cols> ; <rows> ; <device>
+/// BEL`, the device last since it holds `;` of its own. Nothing for a
+/// payload that does not decode.
+pub(crate) fn control_marker(payload: &[u8]) -> Option<Vec<u8>> {
+    let (&holds, rest) = payload.split_first()?;
+    let size = decode_size(rest.get(..8)?).ok()?;
+    let device = std::str::from_utf8(&rest[8..]).ok()?;
+    if !device.is_empty() && !valid_device(device) {
+        return None;
+    }
+    let role = if holds == 1 { "you" } else { "other" };
+    Some(
+        format!(
+            "\x1b]5384;termphin-control;{role};{};{};{device}\x07",
+            size.cols, size.rows
+        )
+        .into_bytes(),
+    )
 }
 
 fn print_version(machine: bool) {
@@ -1237,7 +1532,7 @@ mod tests {
         let mut keys = PresenceKeys::default();
         let (forward, events) = keys.feed(b"ls\x1b]5386;away\x07\x1b]5386;back\x07\r");
         assert_eq!(forward, b"ls\r".to_vec());
-        assert_eq!(events, vec![true, false]);
+        assert_eq!(events, vec![PresenceEvent::Away, PresenceEvent::Back]);
     }
 
     #[test]
@@ -1248,7 +1543,59 @@ mod tests {
         assert!(none.is_empty());
         let (second, events) = keys.feed(b"ay\x07b");
         assert_eq!(second, b"b".to_vec());
-        assert_eq!(events, vec![true]);
+        assert_eq!(events, vec![PresenceEvent::Away]);
+    }
+
+    #[test]
+    fn a_device_message_is_taken_out_whole_or_split() {
+        let mut keys = PresenceKeys::default();
+        let (forward, events) = keys.feed(b"x\x1b]5386;device;id1;phone;UGl4ZWw\x07y");
+        assert_eq!(forward, b"xy".to_vec());
+        assert_eq!(
+            events,
+            vec![PresenceEvent::Device("id1;phone;UGl4ZWw".to_owned())]
+        );
+
+        let (first, none) = keys.feed(b"a\x1b]5386;dev");
+        assert_eq!(first, b"a".to_vec());
+        assert!(none.is_empty());
+        let (second, none) = keys.feed(b"ice;id2;desk");
+        assert!(second.is_empty());
+        assert!(none.is_empty());
+        let (third, events) = keys.feed(b"top;bWJwYw\x07b");
+        assert_eq!(third, b"b".to_vec());
+        assert_eq!(
+            events,
+            vec![PresenceEvent::Device("id2;desktop;bWJwYw".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_device_message_with_anything_odd_is_dropped_not_typed() {
+        let mut keys = PresenceKeys::default();
+        let (forward, events) = keys.feed(b"\x1b]5386;device;a\tb,c\x07z");
+        assert_eq!(forward, b"z".to_vec());
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn an_endless_device_message_goes_to_the_shell() {
+        let mut keys = PresenceKeys::default();
+        let mut input = PRESENCE_DEVICE.to_vec();
+        input.extend(std::iter::repeat_n(b'a', MAX_DEVICE + 5));
+        let (forward, events) = keys.feed(&input);
+        assert_eq!(forward, input);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn device_descriptions_are_url_safe_and_short() {
+        assert!(valid_device("AbC-_9;phone;UGl4ZWw"));
+        assert!(!valid_device(""));
+        assert!(!valid_device("a b"));
+        assert!(!valid_device("a,b"));
+        assert!(!valid_device("a\"b"));
+        assert!(!valid_device(&"a".repeat(MAX_DEVICE + 1)));
     }
 
     #[test]
@@ -1292,9 +1639,12 @@ mod tests {
     #[test]
     fn the_last_client_to_attach_sets_the_size() {
         let mut viewers = Viewers::default();
-        viewers.attached(1, size(40, 20));
+        viewers.attached(1, size(40, 20), false, false);
 
-        assert_eq!(viewers.attached(2, size(200, 50)), size(200, 50));
+        assert_eq!(
+            viewers.attached(2, size(200, 50), false, true),
+            Some(size(200, 50))
+        );
         assert_eq!(viewers.resized(1, size(45, 20)), None);
         assert_eq!(viewers.resized(2, size(180, 50)), Some(size(180, 50)));
     }
@@ -1302,25 +1652,142 @@ mod tests {
     #[test]
     fn typing_hands_the_size_to_whoever_typed() {
         let mut viewers = Viewers::default();
-        viewers.attached(1, size(40, 20));
-        viewers.attached(2, size(200, 50));
+        viewers.attached(1, size(40, 20), false, false);
+        viewers.attached(2, size(200, 50), false, true);
 
-        assert_eq!(viewers.typed(1), Some(size(40, 20)));
-        assert_eq!(viewers.typed(1), None, "already in use");
+        assert_eq!(viewers.typed(1), Typed::Write(Some(size(40, 20))));
+        assert_eq!(viewers.typed(1), Typed::Write(None), "already in use");
         assert_eq!(viewers.resized(2, size(190, 50)), None);
-        assert_eq!(viewers.typed(2), Some(size(190, 50)));
+        assert_eq!(viewers.typed(2), Typed::Write(Some(size(190, 50))));
     }
 
     #[test]
     fn the_size_goes_back_when_the_client_in_use_leaves() {
         let mut viewers = Viewers::default();
-        viewers.attached(1, size(40, 20));
-        viewers.attached(2, size(200, 50));
+        viewers.attached(1, size(40, 20), false, false);
+        viewers.attached(2, size(200, 50), false, true);
 
         assert_eq!(viewers.left(1), None, "was not the one in use");
-        viewers.attached(3, size(100, 30));
+        viewers.attached(3, size(100, 30), false, true);
         assert_eq!(viewers.left(3), Some(size(200, 50)));
         assert_eq!(viewers.left(2), None, "nobody left");
+        assert_eq!(viewers.holder(), None);
+    }
+
+    #[test]
+    fn a_client_that_joined_control_attaches_as_a_viewer_while_the_session_is_held() {
+        let mut viewers = Viewers::default();
+        viewers.attached(1, size(200, 50), true, false);
+
+        assert_eq!(viewers.attached(2, size(40, 20), true, true), None);
+        assert_eq!(viewers.holder(), Some(1));
+        assert_eq!(viewers.size(), Some(size(200, 50)));
+        assert_eq!(viewers.resized(2, size(45, 20)), None);
+    }
+
+    #[test]
+    fn a_client_that_joined_control_takes_a_session_nobody_is_looking_at() {
+        let mut viewers = Viewers::default();
+        viewers.attached(1, size(200, 50), true, false);
+
+        assert_eq!(
+            viewers.attached(2, size(40, 20), true, false),
+            Some(size(40, 20))
+        );
+        assert_eq!(viewers.holder(), Some(2));
+    }
+
+    #[test]
+    fn a_viewer_cannot_type_until_it_takes_control() {
+        let mut viewers = Viewers::default();
+        viewers.attached(1, size(200, 50), true, false);
+        viewers.attached(2, size(40, 20), true, true);
+
+        assert_eq!(viewers.typed(2), Typed::Drop);
+        assert_eq!(viewers.holder(), Some(1));
+        assert_eq!(viewers.take(2), Some(size(40, 20)));
+        assert_eq!(viewers.take(2), None, "already holds it");
+        assert_eq!(viewers.typed(2), Typed::Write(None));
+        assert_eq!(viewers.typed(1), Typed::Drop);
+    }
+
+    #[test]
+    fn an_older_app_still_takes_the_session_by_typing() {
+        let mut viewers = Viewers::default();
+        viewers.attached(1, size(200, 50), true, false);
+        viewers.attached(2, size(40, 20), false, true);
+
+        assert_eq!(viewers.holder(), Some(2), "attaching takes it, as before");
+        viewers.take(1);
+        assert_eq!(viewers.typed(2), Typed::Write(Some(size(40, 20))));
+        assert_eq!(viewers.joined().collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn control_goes_to_the_last_used_client_when_the_holder_leaves() {
+        let mut viewers = Viewers::default();
+        viewers.attached(1, size(200, 50), true, false);
+        viewers.attached(2, size(40, 20), true, true);
+        viewers.attached(3, size(100, 30), true, true);
+
+        assert_eq!(viewers.left(1), Some(size(100, 30)));
+        assert_eq!(viewers.holder(), Some(3));
+    }
+
+    #[test]
+    fn a_device_is_known_by_its_install_id() {
+        assert!(same_device("abc;phone;UGl4ZWw", "abc;phone;TmV3"));
+        assert!(!same_device("abc;phone;UGl4ZWw", "abd;phone;UGl4ZWw"));
+        assert!(!same_device(";phone;UGl4ZWw", ";phone;UGl4ZWw"));
+    }
+
+    #[test]
+    fn the_control_state_becomes_a_marker_for_the_app() {
+        let payload = encode_control_state(false, size(200, 50), "abc;desktop;TWFj");
+
+        assert_eq!(
+            control_marker(&payload).unwrap(),
+            b"\x1b]5384;termphin-control;other;200;50;abc;desktop;TWFj\x07".to_vec()
+        );
+        assert_eq!(
+            control_marker(&encode_control_state(true, size(40, 20), "")).unwrap(),
+            b"\x1b]5384;termphin-control;you;40;20;\x07".to_vec()
+        );
+        let mut forged = encode_control_state(false, size(1, 1), "");
+        forged.extend_from_slice(b"\x07rm");
+        assert_eq!(control_marker(&forged), None);
+        assert_eq!(control_marker(&[1, 0, 0]), None);
+    }
+
+    #[test]
+    fn taking_control_is_taken_out_of_what_is_typed() {
+        let mut keys = PresenceKeys::default();
+
+        let (forward, events) = keys.feed(b"a\x1b]5386;control;take\x07b");
+        assert_eq!(forward, b"ab");
+        assert_eq!(events, vec![PresenceEvent::TakeControl]);
+
+        let (first, none) = keys.feed(b"a\x1b]5386;cont");
+        assert_eq!((first, none), (b"a".to_vec(), vec![]));
+        let (rest, events) = keys.feed(b"rol;take\x07");
+        assert!(rest.is_empty());
+        assert_eq!(events, vec![PresenceEvent::TakeControl]);
+    }
+
+    #[test]
+    fn an_activity_field_round_trips() {
+        for activity in [
+            Activity {
+                state: ActivityState::Waiting,
+                command: Some("claude".to_owned()),
+            },
+            Activity {
+                state: ActivityState::Idle,
+                command: None,
+            },
+        ] {
+            assert_eq!(Activity::parse(&activity.field()), Some(activity));
+        }
     }
 
     #[test]
@@ -1331,9 +1798,41 @@ mod tests {
                 name: "work".to_owned(),
                 created_at: 1000,
                 clients: 2,
+                devices: Vec::new(),
+                activity: None,
             })
         );
         assert_eq!(SessionInfo::parse("work\t1"), None);
+        assert_eq!(
+            SessionInfo::parse("work\t1\t1000\t2\tid1;phone;QQ,bad device,id2;desktop;Qg")
+                .unwrap()
+                .devices,
+            vec!["id1;phone;QQ".to_owned(), "id2;desktop;Qg".to_owned()]
+        );
+        assert_eq!(
+            SessionInfo::parse("work\t1\t1000\t0\t\tworking;bnBtIHJ1biBidWlsZA")
+                .unwrap()
+                .activity,
+            Some(Activity {
+                state: ActivityState::Working,
+                command: Some("npm run build".to_owned()),
+            })
+        );
+        assert_eq!(
+            SessionInfo::parse("work\t1\t1000\t0\t\tidle")
+                .unwrap()
+                .activity,
+            Some(Activity {
+                state: ActivityState::Idle,
+                command: None,
+            })
+        );
+        assert_eq!(
+            SessionInfo::parse("work\t1\t1000\t0\t\tdancing")
+                .unwrap()
+                .activity,
+            None
+        );
     }
 
     #[test]
@@ -1343,11 +1842,15 @@ mod tests {
                 name: "work".to_owned(),
                 created_at: 10_000 - 7200,
                 clients: 0,
+                devices: Vec::new(),
+                activity: None,
             },
             SessionInfo {
                 name: "deploy-prod".to_owned(),
                 created_at: 10_000 - 30,
                 clients: 2,
+                devices: Vec::new(),
+                activity: None,
             },
         ];
 
@@ -1367,6 +1870,8 @@ mod tests {
                     name: (*name).to_owned(),
                     created_at: 0,
                     clients: 0,
+                    devices: Vec::new(),
+                    activity: None,
                 })
                 .collect::<Vec<_>>()
         };
