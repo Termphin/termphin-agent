@@ -95,6 +95,15 @@ impl QuietWatch {
         }
     }
 
+    /// Whether the program wrote something within the last [`QUIET_AFTER`]
+    /// as part of a stretch of work.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(crate) fn working(&self, now: Instant) -> bool {
+        self.busy
+            .as_ref()
+            .is_some_and(|busy| now.saturating_duration_since(busy.last_output) < QUIET_AFTER)
+    }
+
     /// Someone typed into the session.
     pub(crate) fn typed(&mut self) {
         self.busy = None;
@@ -842,6 +851,9 @@ impl Relay {
         let Some((url, key)) = config() else {
             return;
         };
+        if quiet() {
+            return;
+        }
         self.last = Some(Instant::now());
         let mut payload = format!(
             "{{\"key\":{},\"title\":{},\"body\":{},\"session\":{}",
@@ -883,19 +895,46 @@ impl Relay {
     }
 }
 
-/// `<url> <key>` from `~/.config/termphin/relay` - under `%USERPROFILE%` on
-/// Windows - if the app wrote one.
-fn config() -> Option<(String, String)> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    let path = PathBuf::from(home)
-        .join(".config")
-        .join("termphin")
-        .join("relay");
-    let text = std::fs::read_to_string(path).ok()?;
+/// The relay key the app wrote to this server, which also proves to the
+/// presence backend which server is reporting.
+pub(crate) fn relay_key() -> Option<String> {
+    config().map(|(_, key)| key)
+}
+
+/// Whether the relay file ends in `quiet`: the app keeps the key on the
+/// machine for live status while its notifications are off, so nothing is
+/// pushed.
+fn quiet() -> bool {
+    relay_file()
+        .and_then(|text| parse_relay(&text))
+        .is_some_and(|(_, _, quiet)| quiet)
+}
+
+/// `<https url> <key> [quiet]`, as the app writes the relay file.
+pub(crate) fn parse_relay(text: &str) -> Option<(String, String, bool)> {
     let mut parts = text.split_whitespace();
     let url = parts.next()?.to_owned();
     let key = parts.next()?.to_owned();
-    url.starts_with("https://").then_some((url, key))
+    let quiet = parts.next() == Some("quiet");
+    url.starts_with("https://").then_some((url, key, quiet))
+}
+
+fn relay_file() -> Option<String> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    std::fs::read_to_string(
+        PathBuf::from(home)
+            .join(".config")
+            .join("termphin")
+            .join("relay"),
+    )
+    .ok()
+}
+
+/// `<url> <key>` from `~/.config/termphin/relay` - under `%USERPROFILE%` on
+/// Windows - if the app wrote one.
+fn config() -> Option<(String, String)> {
+    let (url, key, _) = parse_relay(&relay_file()?)?;
+    Some((url, key))
 }
 
 pub(crate) fn json_string(text: &str) -> String {
@@ -1419,6 +1458,24 @@ mod tests {
             "it stopped after the phone left"
         );
         assert!(!watchers.saw(start, true), "attached: the app decides");
+    }
+
+    #[test]
+    fn the_relay_file_may_ask_for_quiet() {
+        assert_eq!(
+            parse_relay("https://relay id.secret\n"),
+            Some(("https://relay".to_owned(), "id.secret".to_owned(), false))
+        );
+        assert_eq!(
+            parse_relay("https://relay id.secret quiet\n"),
+            Some(("https://relay".to_owned(), "id.secret".to_owned(), true))
+        );
+        assert_eq!(
+            parse_relay("https://relay id.secret loud").map(|r| r.2),
+            Some(false)
+        );
+        assert_eq!(parse_relay("http://relay id.secret"), None);
+        assert_eq!(parse_relay("https://relay"), None);
     }
 
     #[test]
