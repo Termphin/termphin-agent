@@ -62,13 +62,13 @@ use windows_sys::Win32::System::Threading::{
 use crate::win32_codec::{CWD_PROMPT_HOOK, Win32InputDecoder, base64_utf16le};
 use crate::{
     CLIENT_WRITE_TIMEOUT, CONTROL_JOIN, CONTROL_TAKE, ClientQueue, DetachKey, Ending, FRAME_ATTACH,
-    FRAME_CONTROL, FRAME_CONTROL_STATE, FRAME_DEVICE, FRAME_ERROR, FRAME_EXIT, FRAME_HISTORY,
-    FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_PRESENCE, FRAME_RENAME,
-    FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_STATUS, FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT,
-    History, MAX_CLIENTS, PRESENCE_BACK_MARKER, PresenceEvent, PresenceKeys, REPLAY_CHUNK_SIZE,
-    REPLAY_END_MARKER, RestoreState, SCROLLBACK_FLUSH_EVERY_TICKS, SESSION_ENV, TermSize, Typed,
-    Viewers, control_marker, decode_size, devices_field, encode_control_state, encode_size,
-    invalid_input, read_frame, send_frame, strip_resize_reports, validate_name,
+    FRAME_CONTROL, FRAME_CONTROL_STATE, FRAME_DEVICE, FRAME_DEVICE_CONTROL, FRAME_ERROR,
+    FRAME_EXIT, FRAME_HISTORY, FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_PRESENCE,
+    FRAME_RENAME, FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_STATUS, FRAME_STATUS_RESPONSE,
+    HANDSHAKE_TIMEOUT, History, MAX_CLIENTS, PRESENCE_BACK_MARKER, PresenceEvent, PresenceKeys,
+    REPLAY_CHUNK_SIZE, REPLAY_END_MARKER, RestoreState, SCROLLBACK_FLUSH_EVERY_TICKS, SESSION_ENV,
+    TermSize, Typed, Viewers, control_marker, decode_size, devices_field, encode_control_state,
+    encode_size, invalid_input, read_frame, send_frame, strip_resize_reports, validate_name,
 };
 
 /// Ten cheap console reads a second, against a visible lag on every rotation
@@ -1116,6 +1116,28 @@ impl MasterState {
         Ok(())
     }
 
+    /// What `take`, `away` or `back` asked for a device: applied to its
+    /// newest client for a take, to all of them for away and back.
+    fn device_control(&self, payload: &[u8]) -> io::Result<()> {
+        let (operation, device) = crate::parse_device_control(payload)?;
+        let clients = crate::clients_of_device(
+            self.devices.lock().expect("devices mutex poisoned").iter(),
+            device,
+        );
+        let Some(&newest) = clients.first() else {
+            return Err(invalid_input("no client of that device is attached"));
+        };
+        match operation {
+            crate::DEVICE_TAKE => self.take_control(newest),
+            operation => {
+                for client in clients {
+                    self.presence(client, operation == crate::DEVICE_AWAY)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Tells each client that joined control whether it holds the session,
     /// the size the session runs at and which device holds it.
     fn announce_control(&self) {
@@ -1473,6 +1495,9 @@ fn client_loop(id: u64, pipe: AsyncPipe, state: Arc<MasterState>) {
                 Ok(())
             }
             FRAME_CONTROL if attached && payload == [CONTROL_TAKE] => state.take_control(id),
+            FRAME_DEVICE_CONTROL if !attached => state
+                .device_control(&payload)
+                .and_then(|_| writer.send(FRAME_OK, &[])),
             FRAME_HISTORY if !attached => {
                 replay_requested = true;
                 Ok(())
@@ -1886,6 +1911,12 @@ pub(crate) fn rename_command(old_name: &str, new_name: &str) -> io::Result<()> {
     control_command(old_name, FRAME_RENAME, new_name.as_bytes())
 }
 
+/// `take`, `away` and `back`: a [`crate::FRAME_DEVICE_CONTROL`] sent to the
+/// session's master.
+pub(crate) fn device_command(name: &str, payload: &[u8]) -> io::Result<()> {
+    control_command(name, FRAME_DEVICE_CONTROL, payload)
+}
+
 pub(crate) fn kill_command(name: &str) -> io::Result<()> {
     control_command(name, FRAME_KILL, &[])
 }
@@ -1910,15 +1941,16 @@ pub(crate) fn attach_command(
     replay: bool,
     _resume: Option<String>,
     control: bool,
+    device: Option<&str>,
 ) -> io::Result<()> {
     let _raw_mode = ConsoleRawMode::enable()?;
 
     if !replay {
-        try_attach(name, false, false, control)?;
+        try_attach(name, false, false, control, device)?;
         return Ok(());
     }
-    if try_attach(name, true, false, control)? == Attachment::ReplayRejected {
-        try_attach(name, false, false, control)?;
+    if try_attach(name, true, false, control, device)? == Attachment::ReplayRejected {
+        try_attach(name, false, false, control, device)?;
     }
     Ok(())
 }
@@ -1931,8 +1963,8 @@ const RESET_ON_DETACH: &[u8] =
 
 pub(crate) fn attach_person(name: &str) -> io::Result<Ending> {
     let _raw_mode = ConsoleRawMode::enable()?;
-    let attachment = match try_attach(name, true, true, false)? {
-        Attachment::ReplayRejected => try_attach(name, false, true, false)?,
+    let attachment = match try_attach(name, true, true, false, None)? {
+        Attachment::ReplayRejected => try_attach(name, false, true, false, None)?,
         other => other,
     };
     // Still in VT mode: restored, the console would print these as text.
@@ -1963,7 +1995,13 @@ fn console_size() -> TermSize {
     TermSize { cols: 80, rows: 24 }
 }
 
-fn try_attach(name: &str, replay: bool, detach_key: bool, control: bool) -> io::Result<Attachment> {
+fn try_attach(
+    name: &str,
+    replay: bool,
+    detach_key: bool,
+    control: bool,
+    device: Option<&str>,
+) -> io::Result<Attachment> {
     let size = console_size();
     let pipe = connect_or_create(name, size)?;
     if replay {
@@ -1973,7 +2011,16 @@ fn try_attach(name: &str, replay: bool, detach_key: bool, control: bool) -> io::
         send_frame(&mut &pipe, FRAME_CONTROL, &[CONTROL_JOIN])?;
     }
     send_frame(&mut &pipe, FRAME_ATTACH, &encode_size(size))?;
-    bridge_terminal(pipe, size, replay, detach_key, usize::from(control))
+    if let Some(device) = device {
+        send_frame(&mut &pipe, FRAME_DEVICE, device.as_bytes())?;
+    }
+    bridge_terminal(
+        pipe,
+        size,
+        replay,
+        detach_key,
+        usize::from(control) + usize::from(device.is_some()),
+    )
 }
 
 impl Read for &AsyncPipe {

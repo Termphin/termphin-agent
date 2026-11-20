@@ -16,10 +16,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
     CLIENT_WRITE_TIMEOUT, CONTROL_JOIN, CONTROL_TAKE, CWD_POLL_INTERVAL, ClientQueue, DetachKey,
-    Ending, FRAME_ATTACH, FRAME_CONTROL, FRAME_CONTROL_STATE, FRAME_DEVICE, FRAME_ERROR,
-    FRAME_EXIT, FRAME_HISTORY, FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT, FRAME_PRESENCE,
-    FRAME_RENAME, FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_RESUME, FRAME_RESUME_DONE, FRAME_STATUS,
-    FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT, History, MAX_CLIENTS, OutputPosition,
+    Ending, FRAME_ATTACH, FRAME_CONTROL, FRAME_CONTROL_STATE, FRAME_DEVICE, FRAME_DEVICE_CONTROL,
+    FRAME_ERROR, FRAME_EXIT, FRAME_HISTORY, FRAME_INPUT, FRAME_KILL, FRAME_OK, FRAME_OUTPUT,
+    FRAME_PRESENCE, FRAME_RENAME, FRAME_REPLAY_DONE, FRAME_RESIZE, FRAME_RESUME, FRAME_RESUME_DONE,
+    FRAME_STATUS, FRAME_STATUS_RESPONSE, HANDSHAKE_TIMEOUT, History, MAX_CLIENTS, OutputPosition,
     PRESENCE_BACK_MARKER, PresenceEvent, PresenceKeys, REPLAY_CHUNK_SIZE, REPLAY_END_MARKER,
     RESUME_END_MARKER, RestoreState, SCROLLBACK_FLUSH_EVERY_TICKS, SESSION_ENV, TermSize, Typed,
     Viewers, control_marker, decode_size, devices_field, encode_control_state, encode_size,
@@ -239,6 +239,7 @@ pub(crate) fn attach_command(
     replay: bool,
     resume: Option<String>,
     control: bool,
+    device: Option<&str>,
 ) -> io::Result<()> {
     let resume = resume
         .map(|value| {
@@ -250,14 +251,14 @@ pub(crate) fn attach_command(
     let _raw_mode = RawModeGuard::enable(libc::STDIN_FILENO)?;
 
     if !replay {
-        try_attach(name, false, resume, false, control)?;
+        try_attach(name, false, resume, false, control, device)?;
         return Ok(());
     }
-    if try_attach(name, true, resume, false, control)? == Attachment::ReplayRejected {
+    if try_attach(name, true, resume, false, control, device)? == Attachment::ReplayRejected {
         // Masters started by an older build refuse a history larger than one
         // frame. Reaching a session without its scrollback beats refusing to
         // reach it at all, so drop the replay and attach again.
-        try_attach(name, false, None, false, control)?;
+        try_attach(name, false, None, false, control, device)?;
     }
     Ok(())
 }
@@ -272,8 +273,8 @@ pub(crate) fn attach_person(name: &str) -> io::Result<Ending> {
     install_attach_signal_handlers()?;
     let attachment = {
         let _raw_mode = RawModeGuard::enable(libc::STDIN_FILENO)?;
-        match try_attach(name, true, None, true, false)? {
-            Attachment::ReplayRejected => try_attach(name, false, None, true, false)?,
+        match try_attach(name, true, None, true, false, None)? {
+            Attachment::ReplayRejected => try_attach(name, false, None, true, false, None)?,
             other => other,
         }
     };
@@ -292,6 +293,7 @@ fn try_attach(
     resume: Option<OutputPosition>,
     detach_key: bool,
     control: bool,
+    device: Option<&str>,
 ) -> io::Result<Attachment> {
     let size = terminal_size(libc::STDIN_FILENO);
     let mut stream = connect_or_create(name, size)?;
@@ -313,6 +315,10 @@ fn try_attach(
         optional_frames += 1;
     }
     send_frame(&mut stream, FRAME_ATTACH, &encode_size(from_winsize(size)))?;
+    if let Some(device) = device {
+        send_frame(&mut stream, FRAME_DEVICE, device.as_bytes())?;
+        optional_frames += 1;
+    }
     bridge_terminal(
         stream,
         replay,
@@ -1141,6 +1147,28 @@ impl MasterState {
         Ok(())
     }
 
+    /// What `take`, `away` or `back` asked for a device: applied to its
+    /// newest client for a take, to all of them for away and back.
+    fn device_control(&self, payload: &[u8]) -> io::Result<()> {
+        let (operation, device) = crate::parse_device_control(payload)?;
+        let clients = crate::clients_of_device(
+            self.devices.lock().expect("devices mutex poisoned").iter(),
+            device,
+        );
+        let Some(&newest) = clients.first() else {
+            return Err(invalid_input("no client of that device is attached"));
+        };
+        match operation {
+            crate::DEVICE_TAKE => self.take_control(newest),
+            operation => {
+                for client in clients {
+                    self.presence(client, operation == crate::DEVICE_AWAY)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Tells each client that joined control whether it holds the session,
     /// the size the session runs at and which device holds it.
     fn announce_control(&self) {
@@ -1658,6 +1686,9 @@ fn client_loop(id: u64, mut stream: UnixStream, state: Arc<MasterState>) {
                 Ok(())
             }
             FRAME_CONTROL if attached && payload == [CONTROL_TAKE] => state.take_control(id),
+            FRAME_DEVICE_CONTROL if !attached => state
+                .device_control(&payload)
+                .and_then(|_| writer.send(FRAME_OK, &[])),
             FRAME_HISTORY if !attached => {
                 replay_requested = true;
                 Ok(())
@@ -1821,6 +1852,12 @@ pub(crate) fn session_statuses() -> io::Result<Vec<String>> {
 pub(crate) fn rename_command(old_name: &str, new_name: &str) -> io::Result<()> {
     validate_name(new_name)?;
     control_command(old_name, FRAME_RENAME, new_name.as_bytes())
+}
+
+/// `take`, `away` and `back`: a [`crate::FRAME_DEVICE_CONTROL`] sent to the
+/// session's master.
+pub(crate) fn device_command(name: &str, payload: &[u8]) -> io::Result<()> {
+    control_command(name, FRAME_DEVICE_CONTROL, payload)
 }
 
 pub(crate) fn kill_command(name: &str) -> io::Result<()> {

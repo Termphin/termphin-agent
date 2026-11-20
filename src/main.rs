@@ -62,6 +62,15 @@ pub(crate) const FRAME_DEVICE: u8 = 10;
 pub(crate) const FRAME_CONTROL: u8 = 11;
 pub(crate) const CONTROL_JOIN: u8 = 0;
 pub(crate) const CONTROL_TAKE: u8 = 1;
+/// Sent on a control connection, never an attached one, by `take`, `away`
+/// and `back`: one of [`DEVICE_TAKE`], [`DEVICE_AWAY`], [`DEVICE_BACK`]
+/// followed by an install id, applied to the clients of the device with
+/// that id. The way in for an app whose messages typed into the terminal
+/// never arrive - a Windows console swallows every OSC in its input.
+pub(crate) const FRAME_DEVICE_CONTROL: u8 = 12;
+pub(crate) const DEVICE_TAKE: u8 = 0;
+pub(crate) const DEVICE_AWAY: u8 = 1;
+pub(crate) const DEVICE_BACK: u8 = 2;
 
 pub(crate) const FRAME_OUTPUT: u8 = 101;
 pub(crate) const FRAME_STATUS_RESPONSE: u8 = 102;
@@ -309,6 +318,9 @@ usage: termphin <command>
                         reads OSC 777), e.g. at the end of a long command
   presence              tell the user's apps this machine is online, with its
                         sessions (run from crontab by the app)
+  take <name> <device>  give the session to the app on that device
+  away <name> <device>  that device's app went to the background
+  back <name> <device>  that device's app came back
   version               print the version
 
 Detach with Ctrl-\\ then d. Ctrl-\\ twice sends it to the program.
@@ -324,10 +336,18 @@ fn run() -> io::Result<()> {
             let mut replay = false;
             let mut resume = None;
             let mut control = false;
+            let mut device = None;
             let name = loop {
                 match args.next().as_deref() {
                     Some("--replay") => replay = true,
                     Some("--control") => control = true,
+                    Some("--device") => {
+                        let value = args
+                            .next()
+                            .filter(|value| valid_device(value))
+                            .ok_or_else(|| invalid_input("invalid device description"))?;
+                        device = Some(value);
+                    }
                     // Only read as a string here: positions are a Unix notion,
                     // and Windows takes the flag without acting on it.
                     Some("--resume") => {
@@ -341,8 +361,14 @@ fn run() -> io::Result<()> {
             };
             // The app always passes a flag; a bare attach is a person at a
             // terminal, who gets the replay, a detach key and a choice.
-            if replay || resume.is_some() || control {
-                platform::attach_command(&required_name(name)?, replay, resume, control)?;
+            if replay || resume.is_some() || control || device.is_some() {
+                platform::attach_command(
+                    &required_name(name)?,
+                    replay,
+                    resume,
+                    control,
+                    device.as_deref(),
+                )?;
             } else {
                 attach_person(name)?;
             }
@@ -358,6 +384,19 @@ fn run() -> io::Result<()> {
         "kill" => platform::kill_command(&required_name(args.next())?)?,
         "notify" => notify_command(args.next(), args.collect::<Vec<_>>().join(" "))?,
         "presence" => presence::report(None, true),
+        "take" | "away" | "back" => {
+            let operation = match command.as_str() {
+                "take" => DEVICE_TAKE,
+                "away" => DEVICE_AWAY,
+                _ => DEVICE_BACK,
+            };
+            let name = required_name(args.next())?;
+            let id = args
+                .next()
+                .filter(|id| valid_device_id(id))
+                .ok_or_else(|| invalid_input("invalid device id"))?;
+            platform::device_command(&name, &device_control(operation, &id))?;
+        }
         // Internal re-exec target used to detach the session master from the
         // process that spawned it. Not part of the public CLI.
         #[cfg(windows)]
@@ -778,6 +817,49 @@ pub(crate) fn valid_device(description: &str) -> bool {
 /// What the app types to take control of the session; see
 /// [`FRAME_CONTROL`].
 pub(crate) const CONTROL_TAKE_KEYS: &[u8] = b"\x1b]5386;control;take\x07";
+
+/// Whether [id] could be an install id: the first field of a device
+/// description.
+pub(crate) fn valid_device_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// The payload of [`FRAME_DEVICE_CONTROL`].
+pub(crate) fn device_control(operation: u8, id: &str) -> Vec<u8> {
+    let mut payload = vec![operation];
+    payload.extend_from_slice(id.as_bytes());
+    payload
+}
+
+/// Reads [`FRAME_DEVICE_CONTROL`]: the operation and the install id.
+pub(crate) fn parse_device_control(payload: &[u8]) -> io::Result<(u8, &str)> {
+    let (&operation, id) = payload
+        .split_first()
+        .ok_or_else(|| invalid_input("empty device control frame"))?;
+    let id = std::str::from_utf8(id).map_err(|_| invalid_input("invalid device id"))?;
+    if operation > DEVICE_BACK || !valid_device_id(id) {
+        return Err(invalid_input("invalid device control frame"));
+    }
+    Ok((operation, id))
+}
+
+/// The clients whose device has install id [id], newest first.
+pub(crate) fn clients_of_device<'a>(
+    devices: impl IntoIterator<Item = (&'a u64, &'a String)>,
+    id: &str,
+) -> Vec<u64> {
+    let mut clients = devices
+        .into_iter()
+        .filter(|(_, description)| description.split(';').next() == Some(id))
+        .map(|(client, _)| *client)
+        .collect::<Vec<_>>();
+    clients.sort_unstable_by(|a, b| b.cmp(a));
+    clients
+}
 
 /// Whether two device descriptions name the same device: the same install
 /// id, the first field, whatever its name now says.
@@ -1732,6 +1814,31 @@ mod tests {
 
         assert_eq!(viewers.left(1), Some(size(100, 30)));
         assert_eq!(viewers.holder(), Some(3));
+    }
+
+    #[test]
+    fn a_device_control_round_trips_and_refuses_junk() {
+        let payload = device_control(DEVICE_TAKE, "abc-1");
+        assert_eq!(
+            parse_device_control(&payload).unwrap(),
+            (DEVICE_TAKE, "abc-1")
+        );
+        assert!(parse_device_control(&device_control(7, "abc")).is_err());
+        assert!(parse_device_control(&device_control(DEVICE_AWAY, "a;b")).is_err());
+        assert!(parse_device_control(&[]).is_err());
+        assert!(!valid_device_id(""));
+        assert!(!valid_device_id(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn the_newest_client_of_a_device_comes_first() {
+        let devices = std::collections::HashMap::from([
+            (3_u64, "phone1;phone;UA".to_owned()),
+            (7_u64, "phone1;phone;UA".to_owned()),
+            (5_u64, "desk;desktop;RA".to_owned()),
+        ]);
+        assert_eq!(clients_of_device(&devices, "phone1"), vec![7, 3]);
+        assert!(clients_of_device(&devices, "none").is_empty());
     }
 
     #[test]

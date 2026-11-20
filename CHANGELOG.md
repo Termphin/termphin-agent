@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.1 - 2026-11-20
+
+- Control and device names work on Windows. A Windows console swallows every OSC typed into it, so the app's messages never reached the session there. An app can now name its device when it attaches (`attach --device <id;kind;name>`) and take a session, or say it went to the background and came back, with commands of their own: `termphin-agent take|away|back <session> <device id>`. On Linux and macOS the typed messages keep working for older apps.
+
 ## 0.20.0 - 2026-11-20
 
 - With live presence set up by the app, each session reports the server's sessions - sealed with a key only the user's devices hold - when it starts, every five minutes and when it ends, so the apps show them without connecting. `termphin-agent presence` sends one report; the app runs it from the user's crontab every five minutes and at boot, so a machine without sessions shows as online too. Renaming a session reports at once.
