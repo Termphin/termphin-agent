@@ -1993,6 +1993,18 @@ impl Write for &AsyncPipe {
     }
 }
 
+/// Counts one down from [count] unless it is already zero; whether it did.
+fn take_one(count: &AtomicUsize) -> bool {
+    let mut left = count.load(Ordering::SeqCst);
+    while left > 0 {
+        match count.compare_exchange(left, left - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => left = now,
+        }
+    }
+    false
+}
+
 fn bridge_terminal(
     pipe: AsyncPipe,
     initial_size: TermSize,
@@ -2118,13 +2130,7 @@ fn bridge_terminal(
                 return Ok(Attachment::Detached);
             }
             (FRAME_ERROR, message) => {
-                if message.as_slice() == b"invalid protocol frame"
-                    && tolerated
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                            left.checked_sub(1)
-                        })
-                        .is_ok()
-                {
+                if message.as_slice() == b"invalid protocol frame" && take_one(&tolerated) {
                     continue;
                 }
                 if replay_requested && !painted {
