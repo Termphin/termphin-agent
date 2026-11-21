@@ -3,6 +3,7 @@
 ## 0.20.1 - 2026-11-20
 
 - Control and device names work on Windows. A Windows console swallows every OSC typed into it, so the app's messages never reached the session there. An app can now name its device when it attaches (`attach --device <id;kind;name>`) and take a session, or say it went to the background and came back, with commands of their own: `termphin-agent take|away|back <session> <device id>`. On Linux and macOS the typed messages keep working for older apps.
+- Windows sessions report what they are doing too - idle, working, waiting or running - naming the program the shell is running, so the apps show it on the session's row as they do for Linux and macOS.
 
 ## 0.20.0 - 2026-11-20
 

@@ -939,6 +939,11 @@ struct MasterState {
     /// When the last phone left, so a stop it was there to see is not
     /// announced once it has gone.
     watchers: Mutex<crate::relay::Watchers>,
+    /// What the session is doing, as last worked out by `track_activity`.
+    activity: Mutex<Option<crate::Activity>>,
+    /// The command and the count of its writes when it last went quiet
+    /// asking something - waiting for the user until it writes again.
+    went_quiet: Mutex<Option<(i32, u64)>>,
 }
 
 impl MasterState {
@@ -1245,6 +1250,10 @@ impl MasterState {
                 .line
                 .as_deref()
                 .is_some_and(crate::relay::asks_something);
+            if asks {
+                *self.went_quiet.lock().expect("went quiet mutex poisoned") =
+                    Some((quiet.group, writes));
+            }
             let seen = self
                 .watchers
                 .lock()
@@ -1257,6 +1266,48 @@ impl MasterState {
                     .announced(quiet.group, writes);
                 self.broadcast_output(&quiet.sequence());
             }
+        }
+        self.track_activity(foreground.unwrap_or(0), writes, now);
+    }
+
+    /// Works out what the session is doing and reports it when that changed,
+    /// so the user's apps show it on the session's row - as the Unix master
+    /// does, with the shell's newest child standing in for the foreground
+    /// process group.
+    fn track_activity(&self, command: i32, writes: u64, now: std::time::Instant) {
+        let activity = if command <= 0 || command == self.shell_pid as i32 {
+            crate::Activity {
+                state: crate::ActivityState::Idle,
+                command: None,
+            }
+        } else {
+            let working = self
+                .quiet
+                .lock()
+                .expect("quiet mutex poisoned")
+                .working(now);
+            let waiting = !working
+                && *self.went_quiet.lock().expect("went quiet mutex poisoned")
+                    == Some((command, writes));
+            crate::Activity {
+                state: if working {
+                    crate::ActivityState::Working
+                } else if waiting {
+                    crate::ActivityState::Waiting
+                } else {
+                    crate::ActivityState::Running
+                },
+                command: command_name(command),
+            }
+        };
+        let changed = {
+            let mut current = self.activity.lock().expect("activity mutex poisoned");
+            let changed = current.as_ref() != Some(&activity);
+            *current = Some(activity);
+            changed
+        };
+        if changed {
+            crate::presence::report(None, false);
         }
     }
 
@@ -1368,7 +1419,17 @@ impl MasterState {
                 .expect("devices mutex poisoned")
                 .values(),
         );
-        format!("{name}\t1\t{}\t{attached}\t{devices}", self.created_at)
+        let activity = self
+            .activity
+            .lock()
+            .expect("activity mutex poisoned")
+            .as_ref()
+            .map(crate::Activity::field)
+            .unwrap_or_default();
+        format!(
+            "{name}\t1\t{}\t{attached}\t{devices}\t{activity}",
+            self.created_at
+        )
     }
 
     fn rename(&self, new_name: &str) -> io::Result<()> {
@@ -1623,6 +1684,8 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
         program_writes: AtomicU64::new(0),
         quiet_announced: Mutex::new(crate::relay::QuietAnnounced::default()),
         watchers: Mutex::new(crate::relay::Watchers::default()),
+        activity: Mutex::new(None),
+        went_quiet: Mutex::new(None),
         pseudo_console: Mutex::new(pseudo_console),
         pty_write: Mutex::new(pty_write),
         clients: Mutex::new(HashMap::new()),

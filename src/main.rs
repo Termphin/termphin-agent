@@ -635,7 +635,6 @@ pub(crate) struct Activity {
 impl Activity {
     /// The sixth field of a status line: the state, then `;` and the
     /// command in URL-safe base64 when there is one.
-    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn field(&self) -> String {
         match &self.command {
             Some(command) => format!(

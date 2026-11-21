@@ -97,7 +97,6 @@ impl QuietWatch {
 
     /// Whether the program wrote something within the last [`QUIET_AFTER`]
     /// as part of a stretch of work.
-    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn working(&self, now: Instant) -> bool {
         self.busy
             .as_ref()
