@@ -240,6 +240,7 @@ pub(crate) fn attach_command(
     resume: Option<String>,
     control: bool,
     device: Option<&str>,
+    stdio: Option<TermSize>,
 ) -> io::Result<()> {
     let resume = resume
         .map(|value| {
@@ -248,17 +249,23 @@ pub(crate) fn attach_command(
         })
         .transpose()?;
     install_attach_signal_handlers()?;
-    let _raw_mode = RawModeGuard::enable(libc::STDIN_FILENO)?;
+    // With `--stdio` the app's pipes stand in for a terminal: there is none
+    // to put in raw mode, and its size comes from the app.
+    let _raw_mode = match stdio {
+        None => Some(RawModeGuard::enable(libc::STDIN_FILENO)?),
+        Some(_) => None,
+    };
+    let attach = |replay, resume| try_attach(name, replay, resume, false, control, device, stdio);
 
     if !replay {
-        try_attach(name, false, resume, false, control, device)?;
+        attach(false, resume)?;
         return Ok(());
     }
-    if try_attach(name, true, resume, false, control, device)? == Attachment::ReplayRejected {
+    if attach(true, resume)? == Attachment::ReplayRejected {
         // Masters started by an older build refuse a history larger than one
         // frame. Reaching a session without its scrollback beats refusing to
         // reach it at all, so drop the replay and attach again.
-        try_attach(name, false, None, false, control, device)?;
+        attach(false, None)?;
     }
     Ok(())
 }
@@ -273,8 +280,8 @@ pub(crate) fn attach_person(name: &str) -> io::Result<Ending> {
     install_attach_signal_handlers()?;
     let attachment = {
         let _raw_mode = RawModeGuard::enable(libc::STDIN_FILENO)?;
-        match try_attach(name, true, None, true, false, None)? {
-            Attachment::ReplayRejected => try_attach(name, false, None, true, false, None)?,
+        match try_attach(name, true, None, true, false, None, None)? {
+            Attachment::ReplayRejected => try_attach(name, false, None, true, false, None, None)?,
             other => other,
         }
     };
@@ -294,8 +301,9 @@ fn try_attach(
     detach_key: bool,
     control: bool,
     device: Option<&str>,
+    stdio: Option<TermSize>,
 ) -> io::Result<Attachment> {
-    let size = terminal_size(libc::STDIN_FILENO);
+    let size = stdio.map_or_else(|| terminal_size(libc::STDIN_FILENO), to_winsize);
     let mut stream = connect_or_create(name, size)?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     // Masters that predate an optional frame return an error for it, then
@@ -1946,6 +1954,9 @@ fn bridge_terminal(
                     PresenceEvent::TakeControl => {
                         send_frame(&mut stream, FRAME_CONTROL, &[CONTROL_TAKE])?;
                         tolerated_legacy_errors += 1;
+                    }
+                    PresenceEvent::Resize(size) => {
+                        send_frame(&mut stream, FRAME_RESIZE, &encode_size(size))?
                     }
                 }
             }

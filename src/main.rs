@@ -337,9 +337,17 @@ fn run() -> io::Result<()> {
             let mut resume = None;
             let mut control = false;
             let mut device = None;
+            let mut stdio = None;
             let name = loop {
                 match args.next().as_deref() {
                     Some("--replay") => replay = true,
+                    Some("--stdio") => {
+                        let value = args
+                            .next()
+                            .and_then(|value| parse_size(&value, 'x'))
+                            .ok_or_else(|| invalid_input("expected --stdio <cols>x<rows>"))?;
+                        stdio = Some(value);
+                    }
                     Some("--control") => control = true,
                     Some("--device") => {
                         let value = args
@@ -361,13 +369,14 @@ fn run() -> io::Result<()> {
             };
             // The app always passes a flag; a bare attach is a person at a
             // terminal, who gets the replay, a detach key and a choice.
-            if replay || resume.is_some() || control || device.is_some() {
+            if replay || resume.is_some() || control || device.is_some() || stdio.is_some() {
                 platform::attach_command(
                     &required_name(name)?,
                     replay,
                     resume,
                     control,
                     device.as_deref(),
+                    stdio,
                 )?;
             } else {
                 attach_person(name)?;
@@ -817,6 +826,30 @@ pub(crate) fn valid_device(description: &str) -> bool {
 /// [`FRAME_CONTROL`].
 pub(crate) const CONTROL_TAKE_KEYS: &[u8] = b"\x1b]5386;control;take\x07";
 
+/// What an app attached with `--stdio` types when its terminal changes size,
+/// followed by `<cols>;<rows>` and `BEL`: with no terminal of its own, the
+/// client cannot ask one.
+pub(crate) const PRESENCE_SIZE: &[u8] = b"\x1b]5386;size;";
+
+/// Longest size message body: two five-digit numbers and the `;`.
+const MAX_SIZE_MESSAGE: usize = 11;
+
+/// The size in a `<cols>;<rows>` message, or `<cols>x<rows>` given to
+/// `attach --stdio`; none for anything else or a zero.
+pub(crate) fn parse_size(text: &str, separator: char) -> Option<TermSize> {
+    let (cols, rows) = text.split_once(separator)?;
+    let number = |value: &str| {
+        (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| value.parse::<u16>().ok())
+            .flatten()
+            .filter(|&value| value > 0)
+    };
+    Some(TermSize {
+        cols: number(cols)?,
+        rows: number(rows)?,
+    })
+}
+
 /// Whether [id] could be an install id: the first field of a device
 /// description.
 pub(crate) fn valid_device_id(id: &str) -> bool {
@@ -876,6 +909,7 @@ pub(crate) enum PresenceEvent {
     Back,
     Device(String),
     TakeControl,
+    Resize(TermSize),
 }
 
 /// Takes the app's presence messages out of what is typed, the way
@@ -932,11 +966,30 @@ impl PresenceKeys {
                     break;
                 }
             }
+            if rest.starts_with(PRESENCE_SIZE) {
+                let body = &rest[PRESENCE_SIZE.len()..];
+                let limit = body.len().min(MAX_SIZE_MESSAGE + 1);
+                if let Some(end) = body[..limit].iter().position(|&byte| byte == 0x07) {
+                    if let Some(size) = std::str::from_utf8(&body[..end])
+                        .ok()
+                        .and_then(|text| parse_size(text, ';'))
+                    {
+                        events.push(PresenceEvent::Resize(size));
+                    }
+                    index += PRESENCE_SIZE.len() + end + 1;
+                    continue;
+                }
+                if body.len() <= MAX_SIZE_MESSAGE {
+                    self.pending = rest.to_vec();
+                    break;
+                }
+            }
             if rest.len() >= 2
                 && rest[0] == 0x1b
                 && (PRESENCE_AWAY.starts_with(rest)
                     || PRESENCE_BACK.starts_with(rest)
                     || PRESENCE_DEVICE.starts_with(rest)
+                    || PRESENCE_SIZE.starts_with(rest)
                     || CONTROL_TAKE_KEYS.starts_with(rest))
             {
                 self.pending = rest.to_vec();
@@ -1667,6 +1720,58 @@ mod tests {
         let (forward, events) = keys.feed(&input);
         assert_eq!(forward, input);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_size_message_is_taken_out_whole_or_split() {
+        let mut keys = PresenceKeys::default();
+        let (forward, events) = keys.feed(b"ls\x1b]5386;size;120;40\x07\r");
+        assert_eq!(forward, b"ls\r".to_vec());
+        assert_eq!(
+            events,
+            vec![PresenceEvent::Resize(TermSize {
+                cols: 120,
+                rows: 40
+            })]
+        );
+
+        let (first, none) = keys.feed(b"\x1b]5386;size;8");
+        assert_eq!((first, none), (Vec::new(), vec![]));
+        let (rest, events) = keys.feed(b"0;24\x07");
+        assert!(rest.is_empty());
+        assert_eq!(
+            events,
+            vec![PresenceEvent::Resize(TermSize { cols: 80, rows: 24 })]
+        );
+    }
+
+    #[test]
+    fn a_size_message_with_a_bad_size_is_dropped_and_a_long_one_typed() {
+        let mut keys = PresenceKeys::default();
+        let (forward, events) = keys.feed(b"\x1b]5386;size;0;24\x07");
+        assert!(forward.is_empty() && events.is_empty());
+
+        let mut input = PRESENCE_SIZE.to_vec();
+        input.extend(std::iter::repeat_n(b'1', MAX_SIZE_MESSAGE + 3));
+        let (forward, events) = keys.feed(&input);
+        assert_eq!(forward, input);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn stdio_sizes_are_columns_by_rows() {
+        assert_eq!(
+            parse_size("132x43", 'x'),
+            Some(TermSize {
+                cols: 132,
+                rows: 43
+            })
+        );
+        for bad in [
+            "", "80", "80x", "x24", "0x24", "80x0", "-1x24", "80x24x1", "99999x24",
+        ] {
+            assert_eq!(parse_size(bad, 'x'), None, "{bad}");
+        }
     }
 
     #[test]
