@@ -2005,15 +2005,21 @@ pub(crate) fn attach_command(
     _resume: Option<String>,
     control: bool,
     device: Option<&str>,
+    stdio: Option<TermSize>,
 ) -> io::Result<()> {
-    let _raw_mode = ConsoleRawMode::enable()?;
+    // With `--stdio` the app's pipes stand in for a console: there is none
+    // to switch modes on, and its size comes from the app.
+    let _raw_mode = match stdio {
+        None => Some(ConsoleRawMode::enable()?),
+        Some(_) => None,
+    };
 
     if !replay {
-        try_attach(name, false, false, control, device)?;
+        try_attach(name, false, false, control, device, stdio)?;
         return Ok(());
     }
-    if try_attach(name, true, false, control, device)? == Attachment::ReplayRejected {
-        try_attach(name, false, false, control, device)?;
+    if try_attach(name, true, false, control, device, stdio)? == Attachment::ReplayRejected {
+        try_attach(name, false, false, control, device, stdio)?;
     }
     Ok(())
 }
@@ -2026,8 +2032,8 @@ const RESET_ON_DETACH: &[u8] =
 
 pub(crate) fn attach_person(name: &str) -> io::Result<Ending> {
     let _raw_mode = ConsoleRawMode::enable()?;
-    let attachment = match try_attach(name, true, true, false, None)? {
-        Attachment::ReplayRejected => try_attach(name, false, true, false, None)?,
+    let attachment = match try_attach(name, true, true, false, None, None)? {
+        Attachment::ReplayRejected => try_attach(name, false, true, false, None, None)?,
         other => other,
     };
     // Still in VT mode: restored, the console would print these as text.
@@ -2064,8 +2070,9 @@ fn try_attach(
     detach_key: bool,
     control: bool,
     device: Option<&str>,
+    stdio: Option<TermSize>,
 ) -> io::Result<Attachment> {
-    let size = console_size();
+    let size = stdio.unwrap_or_else(console_size);
     let pipe = connect_or_create(name, size)?;
     if replay {
         send_frame(&mut &pipe, FRAME_HISTORY, &[])?;
@@ -2083,6 +2090,7 @@ fn try_attach(
         replay,
         detach_key,
         usize::from(control) + usize::from(device.is_some()),
+        stdio.is_some(),
     )
 }
 
@@ -2121,6 +2129,7 @@ fn bridge_terminal(
     replay_requested: bool,
     detach_key: bool,
     optional_frames: usize,
+    stdio: bool,
 ) -> io::Result<Attachment> {
     let pipe = Arc::new(pipe);
     let input_pipe = Arc::clone(&pipe);
@@ -2169,6 +2178,9 @@ fn bridge_terminal(
                         input_tolerated.fetch_add(1, Ordering::SeqCst);
                         send_frame(&mut &*input_pipe, FRAME_CONTROL, &[CONTROL_TAKE])
                     }
+                    PresenceEvent::Resize(size) => {
+                        send_frame(&mut &*input_pipe, FRAME_RESIZE, &encode_size(size))
+                    }
                 };
                 if sent.is_err() {
                     return;
@@ -2195,7 +2207,11 @@ fn bridge_terminal(
     let resize_pipe = Arc::clone(&pipe);
     let last_size = Arc::new(Mutex::new(initial_size));
     let resize_last_size = Arc::clone(&last_size);
+    // A console's size is polled; an app on `--stdio` says when it changes.
     thread::spawn(move || {
+        if stdio {
+            return;
+        }
         loop {
             thread::sleep(RESIZE_POLL_INTERVAL);
             let size = console_size();

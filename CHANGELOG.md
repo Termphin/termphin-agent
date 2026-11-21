@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.0 - 2026-11-21
+
+- `attach --stdio <cols>x<rows>` runs the client on plain pipes instead of a terminal, for an app on the same machine that starts it as a process: no raw mode, the size given up front, and later sizes typed in as `ESC ] 5386;size;<cols>;<rows> BEL`. A pipe passes that message on Windows too, where a console would swallow it.
+
 ## 0.20.1 - 2026-11-20
 
 - Control and device names work on Windows. A Windows console swallows every OSC typed into it, so the app's messages never reached the session there. An app can now name its device when it attaches (`attach --device <id;kind;name>`) and take a session, or say it went to the background and came back, with commands of their own: `termphin-agent take|away|back <session> <device id>`. On Linux and macOS the typed messages keep working for older apps.
