@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (0.21.0)
+## 0.21.0 - 2026-11-21
 
 - `attach --stdio <cols>x<rows>` runs the client on plain pipes instead of a terminal, for an app on the same machine that starts it as a process: no raw mode, the size given up front, and later sizes typed in as `ESC ] 5386;size;<cols>;<rows> BEL`. A pipe passes that message on Windows too, where a console would swallow it.
 
