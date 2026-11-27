@@ -934,6 +934,9 @@ struct MasterState {
     /// What the program in front says it is doing over OSC 7501, or through
     /// the hooks of an agent that runs `termphin-agent hook`.
     status: Mutex<crate::status::ProgramStatus>,
+    /// The program in front and what it had running at rest - its MCP
+    /// servers, say - so a finished turn names only what it started since.
+    agent_baseline: Mutex<Option<(u32, std::collections::HashSet<u32>)>>,
     last_line: Mutex<crate::relay::LastLines>,
     /// Pieces of output written while a program held the terminal, which
     /// tells whether it wrote anything after it was announced as quiet.
@@ -1214,6 +1217,9 @@ impl MasterState {
                 }
                 crate::status::Sequence::Report(report) => {
                     changed = true;
+                    if report.state == Some(crate::status::ProgramState::Idle) {
+                        self.note_agent_at_rest();
+                    }
                     let event = self
                         .status
                         .lock()
@@ -1237,7 +1243,65 @@ impl MasterState {
     fn announce_program(&self, event: &crate::status::StatusEvent) {
         let fallback = (*self.foreground.lock().expect("foreground mutex poisoned"))
             .and_then(|pid| command_name(pid as i32));
-        self.broadcast_output(&crate::relay::status_notice(event, fallback.as_deref()));
+        let root = self.agent_root();
+        let mut event = event.clone();
+        let mut still = None;
+        if let (crate::status::StatusEvent::Done { app, msg }, Some(root)) = (&mut event, root) {
+            if msg.is_none()
+                && let Some(app) = app.as_deref()
+            {
+                *msg =
+                    crate::insight::last_reply(app, crate::platform::process_cwd(root).as_deref())
+                        .and_then(|said| crate::status::last_sentences(&said));
+            }
+            let baseline = self
+                .agent_baseline
+                .lock()
+                .expect("agent baseline mutex poisoned")
+                .clone()
+                .filter(|(at, _)| *at == root);
+            if let Some((_, baseline)) = baseline {
+                let parents = crate::platform::process_parents();
+                let (names, more) = crate::insight::still_running(
+                    &parents,
+                    root,
+                    &baseline,
+                    crate::platform::process_label,
+                    crate::platform::process_program,
+                );
+                still = crate::insight::still_running_line(&names, more);
+            }
+        }
+        self.broadcast_output(&crate::relay::status_notice(
+            &event,
+            fallback.as_deref(),
+            still.as_deref(),
+        ));
+    }
+
+    /// The program in front said it is at rest: what it has running now is
+    /// its own - MCP servers and the like - and not news when a turn ends.
+    fn note_agent_at_rest(&self) {
+        let Some(root) = self.agent_root() else {
+            return;
+        };
+        let parents = crate::platform::process_parents();
+        let now = crate::insight::descendants(&parents, root);
+        let mut baseline = self
+            .agent_baseline
+            .lock()
+            .expect("agent baseline mutex poisoned");
+        match baseline.as_mut() {
+            Some((at, known)) if *at == root => known.extend(now),
+            _ => *baseline = Some((root, now)),
+        }
+    }
+
+    /// The program the shell is running, which stands for the program in
+    /// front on Windows - looked up now, since a report can come before the
+    /// next poll has seen the program start.
+    fn agent_root(&self) -> Option<u32> {
+        running_command(self.shell_pid)
     }
 
     /// The user is at the session: what a program finished or failed has
@@ -1802,6 +1866,7 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
         commands: Mutex::new(crate::relay::CommandWatch::default()),
         quiet: Mutex::new(crate::relay::QuietWatch::default()),
         status: Mutex::new(crate::status::ProgramStatus::default()),
+        agent_baseline: Mutex::new(None),
         last_line: Mutex::new(crate::relay::LastLines::default()),
         program_writes: AtomicU64::new(0),
         quiet_announced: Mutex::new(crate::relay::QuietAnnounced::default()),
@@ -2135,6 +2200,63 @@ pub(crate) fn device_command(name: &str, payload: &[u8]) -> io::Result<()> {
 /// Where the session directories are, for finding one by its id.
 pub(crate) fn sessions_dir() -> io::Result<PathBuf> {
     base_dir()
+}
+
+/// Every process's parent, child to parent, from one snapshot of the
+/// process list. Empty when the snapshot fails.
+pub(crate) fn process_parents() -> HashMap<u32, u32> {
+    let mut parents = HashMap::new();
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return parents;
+    }
+    let mut entry = unsafe { std::mem::zeroed::<PROCESSENTRY32W>() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while more {
+        parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+        more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    parents
+}
+
+/// Windows has no cheap way to read another process's working directory;
+/// a transcript is then picked only when it is the only fresh one.
+pub(crate) fn process_cwd(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+/// How notifications name the command process [pid] runs.
+pub(crate) fn process_label(pid: u32) -> Option<String> {
+    command_name(pid as i32)
+}
+
+/// The program file process [pid] runs, by its name alone, from a snapshot
+/// of the process list.
+pub(crate) fn process_program(pid: u32) -> Option<String> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut entry = unsafe { std::mem::zeroed::<PROCESSENTRY32W>() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut found = None;
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while more {
+        if entry.th32ProcessID == pid {
+            let length = entry
+                .szExeFile
+                .iter()
+                .position(|&unit| unit == 0)
+                .unwrap_or(entry.szExeFile.len());
+            found = Some(String::from_utf16_lossy(&entry.szExeFile[..length]));
+            break;
+        }
+        more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    found
 }
 
 /// This process and the ones above it, nearest first, for finding the

@@ -6,6 +6,7 @@ use std::process;
 use std::sync::{Arc, Mutex};
 
 mod hooks;
+mod insight;
 mod presence;
 mod relay;
 mod status;

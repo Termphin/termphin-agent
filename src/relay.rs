@@ -783,7 +783,11 @@ impl NotificationScanner {
 /// or failing as `finished`, so the user's settings for those two kinds, and
 /// for quoting what the program said, hold for it too. [fallback] names the
 /// program when it gave no identifier of its own.
-pub(crate) fn status_notice(event: &crate::status::StatusEvent, fallback: Option<&str>) -> Vec<u8> {
+pub(crate) fn status_notice(
+    event: &crate::status::StatusEvent,
+    fallback: Option<&str>,
+    still_running: Option<&str>,
+) -> Vec<u8> {
     use crate::status::{BlockedKind, StatusEvent};
     let name = event
         .app()
@@ -816,7 +820,15 @@ pub(crate) fn status_notice(event: &crate::status::StatusEvent, fallback: Option
         ),
     };
     let body = msg.as_deref().unwrap_or(plain);
-    notice_sequence(kind, &title, body, plain)
+    match still_running {
+        Some(still) => notice_sequence(
+            kind,
+            &title,
+            &format!("{body} · {still}"),
+            &format!("{plain} · {still}"),
+        ),
+        None => notice_sequence(kind, &title, body, plain),
+    }
 }
 
 /// The notification an OSC body asks for, if it is one.
@@ -1056,7 +1068,7 @@ mod tests {
             msg: Some("Bash: npm test".to_owned()),
         };
         assert_eq!(
-            scanner.feed(&status_notice(&blocked, Some("node"))),
+            scanner.feed(&status_notice(&blocked, Some("node"), None)),
             vec![Notice {
                 kind: Some("quiet".to_owned()),
                 title: "Claude Code needs your permission".to_owned(),
@@ -1069,7 +1081,7 @@ mod tests {
             msg: None,
         };
         assert_eq!(
-            scanner.feed(&status_notice(&done, Some("aider"))),
+            scanner.feed(&status_notice(&done, Some("aider"), None)),
             vec![Notice {
                 kind: Some("finished".to_owned()),
                 title: "aider is done".to_owned(),
@@ -1081,7 +1093,20 @@ mod tests {
             app: Some("codex".to_owned()),
             msg: Some("rate limited".to_owned()),
         };
-        let found = scanner.feed(&status_notice(&failed, None));
+        let found = scanner.feed(&status_notice(&failed, None, None));
+        let still = scanner.feed(&status_notice(
+            &StatusEvent::Done {
+                app: Some("claude".to_owned()),
+                msg: Some("Tests pass.".to_owned()),
+            },
+            None,
+            Some("Still running: npm run dev"),
+        ));
+        assert_eq!(still[0].body, "Tests pass. · Still running: npm run dev");
+        assert_eq!(
+            still[0].plain.as_deref(),
+            Some("Finished · Still running: npm run dev")
+        );
         assert_eq!(found[0].title, "Codex stopped with an error");
         assert_eq!(found[0].kind.as_deref(), Some("finished"));
     }
