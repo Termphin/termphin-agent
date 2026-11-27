@@ -139,6 +139,19 @@ pub(crate) fn base64_utf16le(text: &str) -> String {
     out
 }
 
+/// [text] typed as keys: each character a key press and release in
+/// win32-input-mode (`CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`), which the pseudo
+/// console turns into key events carrying that character. How a reply to a
+/// program's query reaches it on Windows, where the pseudo console drops an
+/// escape sequence written to its input as it is.
+pub(crate) fn typed_as_keys(text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for unit in text.encode_utf16() {
+        out.extend_from_slice(format!("\x1b[0;0;{unit};1;0;1_\x1b[0;0;{unit};0;0;1_").as_bytes());
+    }
+    out
+}
+
 #[cfg(test)]
 mod base64_tests {
     use super::base64_utf16le;
@@ -309,5 +322,18 @@ mod win32_input_decoder_tests {
         let mut decoder = Win32InputDecoder::default();
         let decoded = decoder.feed(seq.as_bytes());
         assert_eq!(decoded, "😀".as_bytes().to_vec());
+    }
+}
+
+#[cfg(test)]
+mod typed_as_keys_tests {
+    use super::typed_as_keys;
+
+    #[test]
+    fn each_character_is_pressed_and_released() {
+        assert_eq!(
+            typed_as_keys("\u{1b}?"),
+            b"\x1b[0;0;27;1;0;1_\x1b[0;0;27;0;0;1_\x1b[0;0;63;1;0;1_\x1b[0;0;63;0;0;1_".to_vec()
+        );
     }
 }

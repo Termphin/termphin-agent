@@ -542,6 +542,7 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
         unsafe { env::set_var(SESSION_ENV, &name) };
 
         let directory = session_dir(&name)?;
+        unsafe { env::set_var(crate::SESSION_ID_ENV, crate::session_id(&directory)) };
         let path = directory.join("control.sock");
         let listener = UnixListener::bind(&path)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
@@ -598,6 +599,8 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
             relay: Mutex::new(crate::relay::Relay::default()),
             commands: Mutex::new(crate::relay::CommandWatch::default()),
             quiet: Mutex::new(crate::relay::QuietWatch::default()),
+            status: Mutex::new(crate::status::ProgramStatus::default()),
+            agent_baseline: Mutex::new(None),
             last_line: Mutex::new(crate::relay::LastLines::default()),
             program_writes: AtomicU64::new(0),
             quiet_announced: Mutex::new(crate::relay::QuietAnnounced::default()),
@@ -609,6 +612,10 @@ fn master_process(name: String, size: libc::winsize, ready_fd: RawFd, restore: R
             binary: Binary::current(),
             upgrade_considered: Mutex::new(None),
         });
+        crate::remember_shell(
+            &state.directory.lock().expect("directory mutex poisoned"),
+            state.shell_pid as u32,
+        );
         spawn_persistence_thread(Arc::clone(&state));
         Ok((listener, reader, state))
     })();
@@ -913,6 +920,12 @@ struct MasterState {
     commands: Mutex<crate::relay::CommandWatch>,
     /// Notices a program that worked for a while and then went quiet.
     quiet: Mutex<crate::relay::QuietWatch>,
+    /// What the program in front says it is doing over OSC 7501, or through
+    /// the hooks of an agent that runs `termphin-agent hook`.
+    status: Mutex<crate::status::ProgramStatus>,
+    /// The program in front and what it had running at rest - its MCP
+    /// servers, say - so a finished turn names only what it started since.
+    agent_baseline: Mutex<Option<(u32, std::collections::HashSet<u32>)>>,
     /// The last line each of the latest two commands wrote, with the
     /// process group it ran as, for the notification its end sends: read as
     /// it writes, since once it ends the shell's prompt - or the next
@@ -1227,7 +1240,133 @@ impl MasterState {
             .expect("commands mutex poisoned")
             .typed(std::time::Instant::now());
         self.quiet.lock().expect("quiet mutex poisoned").typed();
+        self.status_seen();
         self.write_input(data)
+    }
+
+    /// Takes in what [sequences] - OSC 7501 the program wrote, or a hook
+    /// sent - say: the support query is answered, so a program that asks
+    /// first starts reporting, and each report goes to the session's
+    /// records, announcing what it is due.
+    fn program_status(&self, sequences: Vec<crate::status::Sequence>) {
+        let mut changed = false;
+        for sequence in sequences {
+            match sequence {
+                crate::status::Sequence::Query => {
+                    let _ = self.write_input(&crate::status::query_reply());
+                }
+                crate::status::Sequence::Report(report) => {
+                    changed = true;
+                    if report.state == Some(crate::status::ProgramState::Idle) {
+                        self.note_agent_at_rest();
+                    }
+                    let event = self
+                        .status
+                        .lock()
+                        .expect("status mutex poisoned")
+                        .apply(report, std::time::Instant::now());
+                    if let Some(event) = event {
+                        self.announce_program(&event);
+                    }
+                }
+            }
+        }
+        if changed {
+            self.quiet.lock().expect("quiet mutex poisoned").notified();
+            self.refresh_activity();
+        }
+    }
+
+    /// Tells what a program reported - blocked, done, failed - as the
+    /// master's own notification, naming the program in front when it gave
+    /// no name of its own.
+    fn announce_program(&self, event: &crate::status::StatusEvent) {
+        let fd = self.pty.lock().expect("pty mutex poisoned").as_raw_fd();
+        let group = unsafe { libc::tcgetpgrp(fd) };
+        let fallback = (group > 0 && group != self.shell_pid)
+            .then(|| command_name(group))
+            .flatten();
+        let root = self.agent_root();
+        let mut event = event.clone();
+        let mut still = None;
+        if let (crate::status::StatusEvent::Done { app, msg }, Some(root)) = (&mut event, root) {
+            if msg.is_none()
+                && let Some(app) = app.as_deref()
+            {
+                *msg =
+                    crate::insight::last_reply(app, crate::platform::process_cwd(root).as_deref())
+                        .and_then(|said| crate::status::last_sentences(&said));
+            }
+            let baseline = self
+                .agent_baseline
+                .lock()
+                .expect("agent baseline mutex poisoned")
+                .clone()
+                .filter(|(at, _)| *at == root);
+            if let Some((_, baseline)) = baseline {
+                let parents = crate::platform::process_parents();
+                let (names, more) = crate::insight::still_running(
+                    &parents,
+                    root,
+                    &baseline,
+                    crate::platform::process_label,
+                    crate::platform::process_program,
+                );
+                still = crate::insight::still_running_line(&names, more);
+            }
+        }
+        self.broadcast_output(&crate::relay::status_notice(
+            &event,
+            fallback.as_deref(),
+            still.as_deref(),
+        ));
+    }
+
+    /// The program in front said it is at rest: what it has running now is
+    /// its own - MCP servers and the like - and not news when a turn ends.
+    fn note_agent_at_rest(&self) {
+        let Some(root) = self.agent_root() else {
+            return;
+        };
+        let parents = crate::platform::process_parents();
+        let now = crate::insight::descendants(&parents, root);
+        let mut baseline = self
+            .agent_baseline
+            .lock()
+            .expect("agent baseline mutex poisoned");
+        match baseline.as_mut() {
+            Some((at, known)) if *at == root => known.extend(now),
+            _ => *baseline = Some((root, now)),
+        }
+    }
+
+    /// The process leading the program in front, when one other than the
+    /// shell has the terminal.
+    fn agent_root(&self) -> Option<u32> {
+        let fd = self.pty.lock().expect("pty mutex poisoned").as_raw_fd();
+        let group = unsafe { libc::tcgetpgrp(fd) };
+        (group > 0 && group != self.shell_pid).then_some(group as u32)
+    }
+
+    /// The user is at the session: what a program finished or failed has
+    /// been seen, and no longer shows.
+    fn status_seen(&self) {
+        let mut status = self.status.lock().expect("status mutex poisoned");
+        if !status.reporting() {
+            return;
+        }
+        status.seen();
+        drop(status);
+        self.refresh_activity();
+    }
+
+    /// Works the session's activity out again now, rather than at the next
+    /// poll, after the program said something about itself.
+    fn refresh_activity(&self) {
+        let fd = self.pty.lock().expect("pty mutex poisoned").as_raw_fd();
+        let group = unsafe { libc::tcgetpgrp(fd) };
+        let writes = self.program_writes.load(Ordering::SeqCst);
+        self.track_activity(group, writes, std::time::Instant::now());
     }
 
     /// Looks at which process group has the terminal and, when a long
@@ -1235,6 +1374,14 @@ impl MasterState {
     /// notification into the session's output: an attached app shows it,
     /// and with nobody attached the scanner hands it to the relay.
     fn watch_command(&self) {
+        let held = self
+            .status
+            .lock()
+            .expect("status mutex poisoned")
+            .due(std::time::Instant::now());
+        if let Some(event) = held {
+            self.announce_program(&event);
+        }
         let fd = self.pty.lock().expect("pty mutex poisoned").as_raw_fd();
         let group = unsafe { libc::tcgetpgrp(fd) };
         let finished = self
@@ -1277,6 +1424,13 @@ impl MasterState {
             std::time::Instant::now(),
             command_name,
         );
+        let quiet = quiet.filter(|_| {
+            !self
+                .status
+                .lock()
+                .expect("status mutex poisoned")
+                .reporting()
+        });
         if let Some(mut quiet) = quiet {
             quiet.line = self
                 .history
@@ -1310,10 +1464,18 @@ impl MasterState {
     /// Works out what the session is doing and reports it when that changed,
     /// so the user's apps show it on the session's row.
     fn track_activity(&self, group: i32, writes: u64, now: std::time::Instant) {
+        let program = {
+            let mut status = self.status.lock().expect("status mutex poisoned");
+            if group <= 0 || group == self.shell_pid {
+                status.program_ended();
+            }
+            status.summary()
+        };
         let activity = if group <= 0 || group == self.shell_pid {
             crate::Activity {
                 state: crate::ActivityState::Idle,
                 command: None,
+                program,
             }
         } else {
             let working = self
@@ -1324,15 +1486,18 @@ impl MasterState {
             let waiting = !working
                 && *self.went_quiet.lock().expect("went quiet mutex poisoned")
                     == Some((group, writes));
+            let reported = program.as_ref().map(|program| program.state);
             crate::Activity {
-                state: if working {
-                    crate::ActivityState::Working
-                } else if waiting {
-                    crate::ActivityState::Waiting
-                } else {
-                    crate::ActivityState::Running
+                state: match reported {
+                    Some(crate::status::ProgramState::Blocked) => crate::ActivityState::Waiting,
+                    Some(crate::status::ProgramState::Working) => crate::ActivityState::Working,
+                    Some(_) => crate::ActivityState::Running,
+                    None if working => crate::ActivityState::Working,
+                    None if waiting => crate::ActivityState::Waiting,
+                    None => crate::ActivityState::Running,
                 },
                 command: command_name(group),
+                program,
             }
         };
         let changed = {
@@ -1353,7 +1518,10 @@ impl MasterState {
             .lock()
             .expect("quiet mutex poisoned")
             .output(std::time::Instant::now());
-        self.broadcast_output(data);
+        let sequences = self.broadcast_output(data);
+        if !sequences.is_empty() {
+            self.program_status(sequences);
+        }
         let fd = self.pty.lock().expect("pty mutex poisoned").as_raw_fd();
         let group = unsafe { libc::tcgetpgrp(fd) };
         if group <= 0 || group == self.shell_pid {
@@ -1373,16 +1541,31 @@ impl MasterState {
         }
     }
 
-    fn broadcast_output(&self, data: &[u8]) {
+    /// Sends [data] to every attached client and into the history, and
+    /// relays the notifications in it while nobody is there to see them.
+    /// Returns the program status sequences in it, for
+    /// [`Self::program_status`] once nothing here is held.
+    fn broadcast_output(&self, data: &[u8]) -> Vec<crate::status::Sequence> {
         let mut history = self.history.lock().expect("history mutex poisoned");
         history.push(data);
-        let found = self
-            .notifications
-            .lock()
-            .expect("notifications mutex poisoned")
-            .feed(data);
+        let (mut found, sequences) = {
+            let mut scanner = self
+                .notifications
+                .lock()
+                .expect("notifications mutex poisoned");
+            let found = scanner.feed(data);
+            (found, scanner.take_status())
+        };
         if !found.is_empty() {
             self.quiet.lock().expect("quiet mutex poisoned").notified();
+        }
+        if self
+            .status
+            .lock()
+            .expect("status mutex poisoned")
+            .reporting()
+        {
+            found.retain(|notice| notice.kind.is_some());
         }
         let clients = self.clients.lock().expect("clients mutex poisoned");
         if !self.present(&clients) {
@@ -1393,7 +1576,7 @@ impl MasterState {
             }
         }
         if clients.is_empty() {
-            return;
+            return sequences;
         }
         let failed = clients
             .iter()
@@ -1407,6 +1590,7 @@ impl MasterState {
                 clients.remove(&id);
             }
         }
+        sequences
     }
 
     fn write_input(&self, data: &[u8]) -> io::Result<()> {
@@ -1457,15 +1641,15 @@ impl MasterState {
                 .expect("devices mutex poisoned")
                 .values(),
         );
-        let activity = self
+        let (activity, program) = self
             .activity
             .lock()
             .expect("activity mutex poisoned")
             .as_ref()
-            .map(crate::Activity::field)
+            .map(|activity| (activity.field(), activity.program_field()))
             .unwrap_or_default();
         format!(
-            "{name}\t1\t{}\t{attached}\t{devices}\t{activity}",
+            "{name}\t1\t{}\t{attached}\t{devices}\t{activity}\t{program}",
             self.created_at
         )
     }
@@ -1697,6 +1881,14 @@ fn client_loop(id: u64, mut stream: UnixStream, state: Arc<MasterState>) {
             FRAME_DEVICE_CONTROL if !attached => state
                 .device_control(&payload)
                 .and_then(|_| writer.send(FRAME_OK, &[])),
+            crate::FRAME_PROGRAM_STATUS if !attached => {
+                if let Some(report @ crate::status::Sequence::Report(_)) =
+                    crate::status::parse(&payload)
+                {
+                    state.program_status(vec![report]);
+                }
+                writer.send(FRAME_OK, &[])
+            }
             FRAME_HISTORY if !attached => {
                 replay_requested = true;
                 Ok(())
@@ -1716,6 +1908,7 @@ fn client_loop(id: u64, mut stream: UnixStream, state: Arc<MasterState>) {
                         resume_from,
                         size.rows,
                     )?;
+                    state.status_seen();
                 }
                 state.attached_at(id, size, joined)
             }),
@@ -1866,6 +2059,108 @@ pub(crate) fn rename_command(old_name: &str, new_name: &str) -> io::Result<()> {
 /// session's master.
 pub(crate) fn device_command(name: &str, payload: &[u8]) -> io::Result<()> {
     control_command(name, FRAME_DEVICE_CONTROL, payload)
+}
+
+/// Where the session directories are, for finding one by its id.
+pub(crate) fn sessions_dir() -> io::Result<PathBuf> {
+    base_dir()
+}
+
+/// Every process's parent, child to parent: `/proc` on Linux, `ps`
+/// elsewhere. Empty when neither answers.
+pub(crate) fn process_parents() -> HashMap<u32, u32> {
+    let mut parents = HashMap::new();
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if let Some(parent) = parent_of(pid) {
+                parents.insert(pid, parent);
+            }
+        }
+        if !parents.is_empty() {
+            return parents;
+        }
+    }
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+    else {
+        return parents;
+    };
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        if let (Some(Ok(pid)), Some(Ok(parent))) = (
+            fields.next().map(str::parse::<u32>),
+            fields.next().map(str::parse::<u32>),
+        ) {
+            parents.insert(pid, parent);
+        }
+    }
+    parents
+}
+
+/// The working directory of process [pid], where the system says (Linux).
+pub(crate) fn process_cwd(pid: u32) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// How notifications name the command process [pid] runs.
+pub(crate) fn process_label(pid: u32) -> Option<String> {
+    command_name(pid as i32)
+}
+
+/// The program file process [pid] runs, by its name alone: `comm` on
+/// Linux, `ps` elsewhere.
+pub(crate) fn process_program(pid: u32) -> Option<String> {
+    if let Ok(name) = fs::read_to_string(format!("/proc/{pid}/comm")) {
+        return Some(name.trim().to_owned()).filter(|name| !name.is_empty());
+    }
+    let output = std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!name.is_empty()).then_some(name)
+}
+
+/// This process and the ones above it, nearest first, for finding the
+/// session a hook runs in by its shell: `/proc` on Linux, `ps` elsewhere.
+pub(crate) fn ancestors() -> Vec<u32> {
+    let mut chain = vec![std::process::id()];
+    while chain.len() < 64 {
+        let current = *chain.last().expect("never empty");
+        let Some(parent) =
+            parent_of(current).filter(|parent| *parent > 0 && !chain.contains(parent))
+        else {
+            break;
+        };
+        chain.push(parent);
+    }
+    chain
+}
+
+fn parent_of(pid: u32) -> Option<u32> {
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+        let after = &stat[stat.rfind(')')? + 1..];
+        return after.split_whitespace().nth(1)?.parse().ok();
+    }
+    let output = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// `hook`: a program status report from an agent's hook, sent to the
+/// session's master as if the program had written it.
+pub(crate) fn program_status_command(name: &str, body: &[u8]) -> io::Result<()> {
+    control_command(name, crate::FRAME_PROGRAM_STATUS, body)
 }
 
 pub(crate) fn kill_command(name: &str) -> io::Result<()> {
@@ -2366,6 +2661,8 @@ pub(crate) fn resume_master(args: Vec<String>) -> io::Result<()> {
         relay: Mutex::new(crate::relay::Relay::default()),
         commands: Mutex::new(crate::relay::CommandWatch::default()),
         quiet: Mutex::new(crate::relay::QuietWatch::default()),
+        status: Mutex::new(crate::status::ProgramStatus::default()),
+        agent_baseline: Mutex::new(None),
         last_line: Mutex::new(crate::relay::LastLines::default()),
         program_writes: AtomicU64::new(0),
         quiet_announced: Mutex::new(crate::relay::QuietAnnounced::default()),
@@ -2377,6 +2674,10 @@ pub(crate) fn resume_master(args: Vec<String>) -> io::Result<()> {
         binary: Binary::current(),
         upgrade_considered: Mutex::new(None),
     });
+    crate::remember_shell(
+        &state.directory.lock().expect("directory mutex poisoned"),
+        state.shell_pid as u32,
+    );
     spawn_persistence_thread(Arc::clone(&state));
     crate::presence::start_heartbeat();
     run_master(listener, reader, state);

@@ -5,8 +5,11 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{Arc, Mutex};
 
+mod hooks;
+mod insight;
 mod presence;
 mod relay;
+mod status;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -68,6 +71,9 @@ pub(crate) const CONTROL_TAKE: u8 = 1;
 /// that id. The way in for an app whose messages typed into the terminal
 /// never arrive - a Windows console swallows every OSC in its input.
 pub(crate) const FRAME_DEVICE_CONTROL: u8 = 12;
+/// A program status report - the body of an OSC 7501 sequence - that an
+/// agent's hook hands the session's master through `termphin-agent hook`.
+pub(crate) const FRAME_PROGRAM_STATUS: u8 = 13;
 pub(crate) const DEVICE_TAKE: u8 = 0;
 pub(crate) const DEVICE_AWAY: u8 = 1;
 pub(crate) const DEVICE_BACK: u8 = 2;
@@ -321,6 +327,11 @@ usage: termphin <command>
   take <name> <device>  give the session to the app on that device
   away <name> <device>  that device's app went to the background
   back <name> <device>  that device's app came back
+  hook <agent> [json]   hand the session an AI agent's hook event (claude,
+                        codex); what the hooks below run
+  hooks install|remove|status
+                        set up or take out the hooks of Claude Code and
+                        Codex, so their prompts reach Termphin from tmux too
   version               print the version
 
 Detach with Ctrl-\\ then d. Ctrl-\\ twice sends it to the program.
@@ -393,6 +404,11 @@ fn run() -> io::Result<()> {
         "kill" => platform::kill_command(&required_name(args.next())?)?,
         "notify" => notify_command(args.next(), args.collect::<Vec<_>>().join(" "))?,
         "presence" => presence::report(None, true),
+        "hook" => {
+            let agent = args.next();
+            hooks::hook_command(agent, args.collect::<Vec<_>>());
+        }
+        "hooks" => hooks::hooks_command(args.next())?,
         "take" | "away" | "back" => {
             let operation = match command.as_str() {
                 "take" => DEVICE_TAKE,
@@ -459,6 +475,76 @@ fn notify_command(title: Option<String>, body: String) -> io::Result<()> {
 
 /// Set in every session's shell, so an attach from inside one can tell.
 pub(crate) const SESSION_ENV: &str = "TERMPHIN_SESSION";
+
+/// The session's own id in its shell's environment: unlike its name, which
+/// a rename changes after the shell has started, it stays, so a hook run
+/// inside the session still finds it ([`session_named_by_id`]).
+pub(crate) const SESSION_ID_ENV: &str = "TERMPHIN_SESSION_ID";
+
+/// The id of the session whose directory is [directory], kept there as
+/// `id`: made when the session is new and moving with the directory when it
+/// is renamed. A session restored after a reboot keeps the one it had.
+pub(crate) fn session_id(directory: &Path) -> String {
+    use aes_gcm::aead::OsRng;
+    use aes_gcm::aead::rand_core::RngCore;
+    let path = directory.join("id");
+    if let Ok(text) = std::fs::read_to_string(&path)
+        && valid_session_id(text.trim())
+    {
+        return text.trim().to_owned();
+    }
+    let mut bytes = [0_u8; 12];
+    if OsRng.try_fill_bytes(&mut bytes).is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        bytes.copy_from_slice(&nanos.to_le_bytes()[..12]);
+    }
+    let id: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    let _ = std::fs::write(&path, &id);
+    id
+}
+
+pub(crate) fn valid_session_id(text: &str) -> bool {
+    text.len() == 24 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Records [shell_pid] as the session's shell in [directory], for a hook
+/// that has neither the session's id nor its current name to find it by
+/// its own ancestors ([`session_named_by_ancestry`]): a shell started before
+/// ids existed. Written by every master, a master that took over a running
+/// session included.
+pub(crate) fn remember_shell(directory: &Path, shell_pid: u32) {
+    let _ = std::fs::write(directory.join("shell_pid"), shell_pid.to_string());
+}
+
+/// The name of the session whose shell is one of [ancestors] - the hook's
+/// own process and the processes above it - among the session directories
+/// in [base].
+pub(crate) fn session_named_by_ancestry(base: &Path, ancestors: &[u32]) -> Option<String> {
+    std::fs::read_dir(base).ok()?.flatten().find_map(|entry| {
+        let pid: u32 = std::fs::read_to_string(entry.path().join("shell_pid"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        (pid > 1 && ancestors.contains(&pid))
+            .then(|| entry.file_name().to_string_lossy().into_owned())
+    })
+}
+
+/// The name, now, of the session whose id is [id], among the session
+/// directories in [base].
+pub(crate) fn session_named_by_id(base: &Path, id: &str) -> Option<String> {
+    if !valid_session_id(id) {
+        return None;
+    }
+    std::fs::read_dir(base).ok()?.flatten().find_map(|entry| {
+        let found = std::fs::read_to_string(entry.path().join("id")).ok()?;
+        (found.trim() == id).then(|| entry.file_name().to_string_lossy().into_owned())
+    })
+}
 
 fn refuse_nesting() -> io::Result<()> {
     match env::var(SESSION_ENV) {
@@ -639,6 +725,9 @@ impl ActivityState {
 pub(crate) struct Activity {
     pub(crate) state: ActivityState,
     pub(crate) command: Option<String>,
+    /// What the program in front says it is doing over OSC 7501 - blocked
+    /// on the user, working, done - when it says.
+    pub(crate) program: Option<status::Summary>,
 }
 
 impl Activity {
@@ -666,6 +755,49 @@ impl Activity {
         Some(Self {
             state: ActivityState::parse(state)?,
             command,
+            program: None,
+        })
+    }
+
+    /// The seventh field of a status line: the program's own state, its
+    /// kind of block, its identifier and its message in URL-safe base64,
+    /// separated by `;` - empty when the program says nothing.
+    pub(crate) fn program_field(&self) -> String {
+        let Some(program) = &self.program else {
+            return String::new();
+        };
+        format!(
+            "{};{};{};{}",
+            program.state.as_str(),
+            program.kind.map(status::BlockedKind::as_str).unwrap_or(""),
+            program.app.as_deref().unwrap_or(""),
+            program
+                .msg
+                .as_deref()
+                .map(|msg| presence::encode_base64url(msg.as_bytes()))
+                .unwrap_or_default()
+        )
+    }
+
+    /// Reads [`Self::program_field`] back.
+    pub(crate) fn parse_program(field: &str) -> Option<status::Summary> {
+        let mut parts = field.split(';');
+        let state = status::ProgramState::parse_name(parts.next()?)?;
+        let kind = parts.next().and_then(status::BlockedKind::parse_name);
+        let app = parts
+            .next()
+            .filter(|app| !app.is_empty())
+            .map(str::to_owned);
+        let msg = parts
+            .next()
+            .filter(|msg| !msg.is_empty())
+            .and_then(presence::decode_base64url)
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        Some(status::Summary {
+            state,
+            kind,
+            app,
+            msg,
         })
     }
 }
@@ -687,7 +819,10 @@ impl SessionInfo {
                     .collect()
             })
             .unwrap_or_default();
-        let activity = fields.next().and_then(Activity::parse);
+        let mut activity = fields.next().and_then(Activity::parse);
+        if let Some(activity) = activity.as_mut() {
+            activity.program = fields.next().and_then(Activity::parse_program);
+        }
         Some(Self {
             name,
             created_at,
@@ -1621,6 +1756,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_session_keeps_its_id_and_is_found_by_it_after_a_rename() {
+        let base = std::env::temp_dir().join(format!("termphin-id-test-{}", process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("termphin_old")).unwrap();
+        std::fs::create_dir_all(base.join("other")).unwrap();
+        let id = session_id(&base.join("termphin_old"));
+        assert!(valid_session_id(&id));
+        assert_eq!(session_id(&base.join("termphin_old")), id);
+        assert_ne!(session_id(&base.join("other")), id);
+        std::fs::rename(base.join("termphin_old"), base.join("termphin_new")).unwrap();
+        assert_eq!(
+            session_named_by_id(&base, &id).as_deref(),
+            Some("termphin_new")
+        );
+        assert_eq!(session_named_by_id(&base, "not-an-id"), None);
+        assert_eq!(session_named_by_id(&base, &"0".repeat(24)), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_session_is_found_by_its_shell_among_the_hooks_ancestors() {
+        let base = std::env::temp_dir().join(format!("termphin-shell-test-{}", process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for name in ["termphin_a", "termphin_b", "termphin_c"] {
+            std::fs::create_dir_all(base.join(name)).unwrap();
+        }
+        remember_shell(&base.join("termphin_a"), 4100);
+        remember_shell(&base.join("termphin_b"), 4200);
+        std::fs::write(base.join("termphin_c").join("shell_pid"), "1").unwrap();
+        assert_eq!(
+            session_named_by_ancestry(&base, &[9001, 9000, 4200, 1]).as_deref(),
+            Some("termphin_b")
+        );
+        assert_eq!(session_named_by_ancestry(&base, &[9001, 1]), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_session_line_carries_what_its_program_says_and_reads_back() {
+        let activity = Activity {
+            state: ActivityState::Waiting,
+            command: Some("claude".to_owned()),
+            program: Some(status::Summary {
+                state: status::ProgramState::Blocked,
+                kind: Some(status::BlockedKind::Question),
+                app: Some("claude".to_owned()),
+                msg: Some("Which branch; main or dev?".to_owned()),
+            }),
+        };
+        let line = format!(
+            "work\t1\t1000\t0\t\t{}\t{}",
+            activity.field(),
+            activity.program_field()
+        );
+        let parsed = SessionInfo::parse(&line).expect("a session line");
+        assert_eq!(parsed.activity, Some(activity));
+    }
+
+    #[test]
+    fn a_session_line_from_an_older_master_has_no_program() {
+        let parsed = SessionInfo::parse("work\t1\t1000\t0\t\tidle").expect("a session line");
+        assert_eq!(parsed.activity.and_then(|activity| activity.program), None);
+    }
+
+    #[test]
     fn resize_reports_are_dropped_and_nothing_else() {
         assert_eq!(
             &*strip_resize_reports(b"a\x1b[8;12;40tb\x1b[8;30;100t"),
@@ -1991,10 +2191,12 @@ mod tests {
             Activity {
                 state: ActivityState::Waiting,
                 command: Some("claude".to_owned()),
+                program: None,
             },
             Activity {
                 state: ActivityState::Idle,
                 command: None,
+                program: None,
             },
         ] {
             assert_eq!(Activity::parse(&activity.field()), Some(activity));
@@ -2027,6 +2229,7 @@ mod tests {
             Some(Activity {
                 state: ActivityState::Working,
                 command: Some("npm run build".to_owned()),
+                program: None,
             })
         );
         assert_eq!(
@@ -2036,6 +2239,7 @@ mod tests {
             Some(Activity {
                 state: ActivityState::Idle,
                 command: None,
+                program: None,
             })
         );
         assert_eq!(
