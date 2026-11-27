@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.22.2 - 2026-11-27
+
+- Sessions speak the OSC 7501 Program Status Protocol. The master answers its support query - Claude Code and others report only once a terminal does - and a program that reports becoming blocked on the user (a permission, a question, a sign-in), done or failed gets a notification saying so, with its own line: "Claude Code needs your permission - approve Bash". Blocked is announced as `quiet` and done or failed as `finished`, so the app's switches for those kinds hold. A program that reports is no longer guessed at from silence, and its OSC 9/777/99 notifications are not relayed twice.
+- What the program reports is in the status line's seventh field and in presence as the activity's `program`: state, kind of block, program and message.
+- `termphin-agent hook claude|codex` hands the session a Claude Code hook event or Codex `notify` call, through `TERMPHIN_SESSION` and a new `FRAME_PROGRAM_STATUS` frame, for agents in tmux (which drops OSC 7501) or too old to report. `termphin-agent hooks install|remove|status` puts those hooks into `~/.claude/settings.json` and `~/.codex/config.toml`, keeping everything else and a copy of each file. Permission prompts name the tool, never what it runs.
+- A finished turn quotes the last two sentences the agent said, from a Claude Code `Stop` hook or Codex's `notify`; a bare `done` waits a moment and a half for them. A session keeps its own id (`TERMPHIN_SESSION_ID`), so a hook still finds it after a rename; a shell started before that, in a session whose master was upgraded in place, is found by the hook through its own ancestors and the `shell_pid` every master now records, so nothing needs restarting. Windows sessions speak OSC 7501 too, the support reply typed in as key presses since the pseudo console drops it otherwise, and `hooks install` works there. Antigravity is named as such.
+- A Windows attach client exits when the app's pipe closes, instead of staying attached to a session nobody sees. A Windows app started inside a job that forbids breaking away can start sessions again.
+
 ## 0.21.0 - 2026-11-21
 
 - `attach --stdio <cols>x<rows>` runs the client on plain pipes instead of a terminal, for an app on the same machine that starts it as a process: no raw mode, the size given up front, and later sizes typed in as `ESC ] 5386;size;<cols>;<rows> BEL`. A pipe passes that message on Windows too, where a console would swallow it.

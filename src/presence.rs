@@ -273,9 +273,31 @@ fn activity_json(activity: Option<&crate::Activity>) -> String {
         .map(json_string)
         .unwrap_or_else(|| "null".to_owned());
     format!(
-        ",\"activity\":{{\"state\":\"{}\",\"command\":{}}}",
+        ",\"activity\":{{\"state\":\"{}\",\"command\":{}{}}}",
         activity.state.as_str(),
-        command
+        command,
+        program_json(activity.program.as_ref())
+    )
+}
+
+/// The program's own state inside a session's activity, for the app to say
+/// "Claude Code needs your permission" rather than only "waiting".
+fn program_json(program: Option<&crate::status::Summary>) -> String {
+    let Some(program) = program else {
+        return String::new();
+    };
+    let optional =
+        |value: Option<&str>| value.map(json_string).unwrap_or_else(|| "null".to_owned());
+    let msg = program
+        .msg
+        .as_deref()
+        .map(|msg| msg.chars().take(200).collect::<String>());
+    format!(
+        ",\"program\":{{\"state\":\"{}\",\"kind\":{},\"app\":{},\"msg\":{}}}",
+        program.state.as_str(),
+        optional(program.kind.map(crate::status::BlockedKind::as_str)),
+        optional(program.app.as_deref()),
+        optional(msg.as_deref())
     )
 }
 
@@ -434,17 +456,38 @@ mod tests {
         working.activity = Some(crate::Activity {
             state: crate::ActivityState::Working,
             command: Some("npm \"run\"".to_owned()),
+            program: None,
         });
         let mut idle = session("idle");
         idle.activity = Some(crate::Activity {
             state: crate::ActivityState::Idle,
             command: None,
+            program: None,
         });
         let text = plaintext(&[working, idle], &[], 1);
         assert!(
             text.contains(",\"activity\":{\"state\":\"working\",\"command\":\"npm \\\"run\\\"\"}")
         );
         assert!(text.contains(",\"activity\":{\"state\":\"idle\",\"command\":null}"));
+    }
+
+    #[test]
+    fn plaintext_carries_what_the_program_says_it_is_doing() {
+        let mut agent = session("agent");
+        agent.activity = Some(crate::Activity {
+            state: crate::ActivityState::Waiting,
+            command: Some("claude".to_owned()),
+            program: Some(crate::status::Summary {
+                state: crate::status::ProgramState::Blocked,
+                kind: Some(crate::status::BlockedKind::Permission),
+                app: Some("claude".to_owned()),
+                msg: Some("Bash: \"npm test\"".to_owned()),
+            }),
+        });
+        let text = plaintext(&[agent], &[], 1);
+        assert!(text.contains(
+            ",\"program\":{\"state\":\"blocked\",\"kind\":\"permission\",\"app\":\"claude\",\"msg\":\"Bash: \\\"npm test\\\"\"}"
+        ));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "termphin-agent"
-version = "0.21.0"
+version = "0.22.2"
 edition = "2024"
 license = "MIT"
 description = "Persistent single-PTY session helper for Termphin"
@@ -37,3 +37,4 @@ strip = true
 [dependencies]
 vt100 = "0.16.2"
 aes-gcm = "0.10"
+serde_json = { version = "1", features = ["preserve_order"] }

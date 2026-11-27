@@ -19,9 +19,10 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Longest OSC body kept while scanning; anything longer is not a
-/// notification worth carrying and is dropped.
-const MAX_OSC: usize = 1024;
+/// Longest OSC body kept while scanning - as long as a program status
+/// report may be; anything longer is not a notification worth carrying and
+/// is dropped.
+const MAX_OSC: usize = crate::status::MAX_SEQUENCE;
 
 /// Shortest gap between two relayed notifications from one session.
 const QUIET: Duration = Duration::from_secs(3);
@@ -685,11 +686,14 @@ pub(crate) fn notice_sequence(kind: &str, title: &str, body: &str, plain: &str) 
     .into_bytes()
 }
 
-/// Finds notification sequences in output that arrives in arbitrary pieces.
+/// Finds notification sequences in output that arrives in arbitrary pieces,
+/// and keeps the program status sequences (`OSC 7501`) it passes for
+/// [`NotificationScanner::take_status`].
 #[derive(Default)]
 pub(crate) struct NotificationScanner {
     state: ScanState,
     body: Vec<u8>,
+    status: Vec<crate::status::Sequence>,
 }
 
 #[derive(Default, PartialEq)]
@@ -727,7 +731,7 @@ impl NotificationScanner {
                 }
                 ScanState::Osc => match byte {
                     0x07 => {
-                        found.extend(parse(&self.body));
+                        found.extend(self.finish());
                         self.state = ScanState::Text;
                     }
                     0x1b => self.state = ScanState::OscEscape,
@@ -741,7 +745,7 @@ impl NotificationScanner {
                 },
                 ScanState::OscEscape => {
                     if byte == b'\\' {
-                        found.extend(parse(&self.body));
+                        found.extend(self.finish());
                         self.state = ScanState::Text;
                     } else if byte == b']' {
                         self.state = ScanState::Osc;
@@ -754,6 +758,65 @@ impl NotificationScanner {
         }
         found
     }
+
+    /// The OSC sequence just ended: a notification, or a program status
+    /// sequence kept for [`Self::take_status`].
+    fn finish(&mut self) -> Option<Notice> {
+        if let Some(rest) = self.body.strip_prefix(b"7501;") {
+            if let Some(sequence) = crate::status::parse(rest) {
+                self.status.push(sequence);
+            }
+            return None;
+        }
+        parse(&self.body)
+    }
+
+    /// The program status sequences found since the last call, in order.
+    pub(crate) fn take_status(&mut self) -> Vec<crate::status::Sequence> {
+        std::mem::take(&mut self.status)
+    }
+}
+
+/// The notification the master announces for [event], the moment a
+/// program reported over OSC 7501: being blocked is told as `quiet` - the
+/// program waits for the user, as one that went quiet does - and being done
+/// or failing as `finished`, so the user's settings for those two kinds, and
+/// for quoting what the program said, hold for it too. [fallback] names the
+/// program when it gave no identifier of its own.
+pub(crate) fn status_notice(event: &crate::status::StatusEvent, fallback: Option<&str>) -> Vec<u8> {
+    use crate::status::{BlockedKind, StatusEvent};
+    let name = event
+        .app()
+        .map(crate::status::app_name)
+        .or_else(|| fallback.map(str::to_owned))
+        .unwrap_or_else(|| "A program".to_owned());
+    let (kind, title, plain, msg) = match event {
+        StatusEvent::Blocked { kind, msg, .. } => (
+            "quiet",
+            match kind {
+                Some(BlockedKind::Permission) => format!("{name} needs your permission"),
+                Some(BlockedKind::Question) => format!("{name} has a question"),
+                Some(BlockedKind::Auth) => format!("{name} needs you to sign in"),
+                None => format!("{name} needs you"),
+            },
+            "Waiting for you",
+            msg,
+        ),
+        StatusEvent::Done { msg, .. } => (
+            "finished",
+            format!("{name} is done"),
+            "Finished",
+            &msg.as_deref().and_then(crate::status::last_sentences),
+        ),
+        StatusEvent::Error { msg, .. } => (
+            "finished",
+            format!("{name} stopped with an error"),
+            "Stopped",
+            msg,
+        ),
+    };
+    let body = msg.as_deref().unwrap_or(plain);
+    notice_sequence(kind, &title, body, plain)
 }
 
 /// The notification an OSC body asks for, if it is one.
@@ -954,6 +1017,74 @@ pub(crate) fn json_string(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_status_sequences_are_kept_apart_even_in_pieces() {
+        let mut scanner = NotificationScanner::default();
+        assert!(
+            scanner
+                .feed(b"x\x1b]7501;?\x1b\\y\x1b]7501;state=bl")
+                .is_empty()
+        );
+        assert!(scanner.feed(b"ocked:kind=permission\x07").is_empty());
+        let found = scanner.take_status();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0], crate::status::Sequence::Query);
+        assert!(matches!(
+            &found[1],
+            crate::status::Sequence::Report(report)
+                if report.state == Some(crate::status::ProgramState::Blocked)
+        ));
+        assert!(scanner.take_status().is_empty());
+    }
+
+    #[test]
+    fn a_long_program_status_report_is_still_read() {
+        let msg = crate::presence::encode_base64("x".repeat(1500).as_bytes());
+        let mut scanner = NotificationScanner::default();
+        scanner.feed(format!("\x1b]7501;state=blocked:msg={msg}\x07").as_bytes());
+        assert_eq!(scanner.take_status().len(), 1);
+    }
+
+    #[test]
+    fn a_program_blocked_done_or_failing_is_told_as_the_kinds_the_user_set() {
+        use crate::status::{BlockedKind, StatusEvent};
+        let mut scanner = NotificationScanner::default();
+        let blocked = StatusEvent::Blocked {
+            app: Some("claude".to_owned()),
+            kind: Some(BlockedKind::Permission),
+            msg: Some("Bash: npm test".to_owned()),
+        };
+        assert_eq!(
+            scanner.feed(&status_notice(&blocked, Some("node"))),
+            vec![Notice {
+                kind: Some("quiet".to_owned()),
+                title: "Claude Code needs your permission".to_owned(),
+                body: "Bash: npm test".to_owned(),
+                plain: Some("Waiting for you".to_owned()),
+            }]
+        );
+        let done = StatusEvent::Done {
+            app: None,
+            msg: None,
+        };
+        assert_eq!(
+            scanner.feed(&status_notice(&done, Some("aider"))),
+            vec![Notice {
+                kind: Some("finished".to_owned()),
+                title: "aider is done".to_owned(),
+                body: "Finished".to_owned(),
+                plain: Some("Finished".to_owned()),
+            }]
+        );
+        let failed = StatusEvent::Error {
+            app: Some("codex".to_owned()),
+            msg: Some("rate limited".to_owned()),
+        };
+        let found = scanner.feed(&status_notice(&failed, None));
+        assert_eq!(found[0].title, "Codex stopped with an error");
+        assert_eq!(found[0].kind.as_deref(), Some("finished"));
+    }
 
     fn pairs(found: Vec<Notice>) -> Vec<(String, String)> {
         found

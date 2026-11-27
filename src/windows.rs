@@ -931,6 +931,9 @@ struct MasterState {
     relay: Mutex<crate::relay::Relay>,
     commands: Mutex<crate::relay::CommandWatch>,
     quiet: Mutex<crate::relay::QuietWatch>,
+    /// What the program in front says it is doing over OSC 7501, or through
+    /// the hooks of an agent that runs `termphin-agent hook`.
+    status: Mutex<crate::status::ProgramStatus>,
     last_line: Mutex<crate::relay::LastLines>,
     /// Pieces of output written while a program held the terminal, which
     /// tells whether it wrote anything after it was announced as quiet.
@@ -1193,7 +1196,70 @@ impl MasterState {
             .expect("commands mutex poisoned")
             .typed(std::time::Instant::now());
         self.quiet.lock().expect("quiet mutex poisoned").typed();
+        self.status_seen();
         self.write_input(data)
+    }
+
+    /// Takes in what [sequences] - OSC 7501 the program wrote, or a hook
+    /// sent - say, as the Unix master does: the support query is answered,
+    /// and each report goes to the session's records, announcing what it is
+    /// due.
+    fn program_status(&self, sequences: Vec<crate::status::Sequence>) {
+        let mut changed = false;
+        for sequence in sequences {
+            match sequence {
+                crate::status::Sequence::Query => {
+                    let reply = String::from_utf8_lossy(&crate::status::query_reply()).into_owned();
+                    let _ = self.write_input(&crate::win32_codec::typed_as_keys(&reply));
+                }
+                crate::status::Sequence::Report(report) => {
+                    changed = true;
+                    let event = self
+                        .status
+                        .lock()
+                        .expect("status mutex poisoned")
+                        .apply(report, std::time::Instant::now());
+                    if let Some(event) = event {
+                        self.announce_program(&event);
+                    }
+                }
+            }
+        }
+        if changed {
+            self.quiet.lock().expect("quiet mutex poisoned").notified();
+            self.refresh_activity();
+        }
+    }
+
+    /// Tells what a program reported - blocked, done, failed - as the
+    /// master's own notification, naming the program in front when it gave
+    /// no name of its own.
+    fn announce_program(&self, event: &crate::status::StatusEvent) {
+        let fallback = (*self.foreground.lock().expect("foreground mutex poisoned"))
+            .and_then(|pid| command_name(pid as i32));
+        self.broadcast_output(&crate::relay::status_notice(event, fallback.as_deref()));
+    }
+
+    /// The user is at the session: what a program finished or failed has
+    /// been seen, and no longer shows.
+    fn status_seen(&self) {
+        let mut status = self.status.lock().expect("status mutex poisoned");
+        if !status.reporting() {
+            return;
+        }
+        status.seen();
+        drop(status);
+        self.refresh_activity();
+    }
+
+    /// Works the session's activity out again now, after the program said
+    /// something about itself.
+    fn refresh_activity(&self) {
+        let foreground = (*self.foreground.lock().expect("foreground mutex poisoned"))
+            .map(|pid| pid as i32)
+            .unwrap_or(0);
+        let writes = self.program_writes.load(Ordering::SeqCst);
+        self.track_activity(foreground, writes, std::time::Instant::now());
     }
 
     /// Looks at which command the shell is running and, as the Unix master
@@ -1201,6 +1267,14 @@ impl MasterState {
     /// program that went quiet, by writing the notification into the
     /// session's output.
     fn watch_command(&self) {
+        let held = self
+            .status
+            .lock()
+            .expect("status mutex poisoned")
+            .due(std::time::Instant::now());
+        if let Some(event) = held {
+            self.announce_program(&event);
+        }
         let running = running_command(self.shell_pid);
         *self.foreground.lock().expect("foreground mutex poisoned") = running;
         let shell = self.shell_pid as i32;
@@ -1240,6 +1314,13 @@ impl MasterState {
             now,
             command_name,
         );
+        let quiet = quiet.filter(|_| {
+            !self
+                .status
+                .lock()
+                .expect("status mutex poisoned")
+                .reporting()
+        });
         if let Some(mut quiet) = quiet {
             quiet.line = self
                 .history
@@ -1275,10 +1356,18 @@ impl MasterState {
     /// does, with the shell's newest child standing in for the foreground
     /// process group.
     fn track_activity(&self, command: i32, writes: u64, now: std::time::Instant) {
+        let program = {
+            let mut status = self.status.lock().expect("status mutex poisoned");
+            if command <= 0 || command == self.shell_pid as i32 {
+                status.program_ended();
+            }
+            status.summary()
+        };
         let activity = if command <= 0 || command == self.shell_pid as i32 {
             crate::Activity {
                 state: crate::ActivityState::Idle,
                 command: None,
+                program,
             }
         } else {
             let working = self
@@ -1289,15 +1378,18 @@ impl MasterState {
             let waiting = !working
                 && *self.went_quiet.lock().expect("went quiet mutex poisoned")
                     == Some((command, writes));
+            let reported = program.as_ref().map(|program| program.state);
             crate::Activity {
-                state: if working {
-                    crate::ActivityState::Working
-                } else if waiting {
-                    crate::ActivityState::Waiting
-                } else {
-                    crate::ActivityState::Running
+                state: match reported {
+                    Some(crate::status::ProgramState::Blocked) => crate::ActivityState::Waiting,
+                    Some(crate::status::ProgramState::Working) => crate::ActivityState::Working,
+                    Some(_) => crate::ActivityState::Running,
+                    None if working => crate::ActivityState::Working,
+                    None if waiting => crate::ActivityState::Waiting,
+                    None => crate::ActivityState::Running,
                 },
                 command: command_name(command),
+                program,
             }
         };
         let changed = {
@@ -1318,7 +1410,10 @@ impl MasterState {
             .lock()
             .expect("quiet mutex poisoned")
             .output(std::time::Instant::now());
-        self.broadcast_output(data);
+        let sequences = self.broadcast_output(data);
+        if !sequences.is_empty() {
+            self.program_status(sequences);
+        }
         let Some(pid) = *self.foreground.lock().expect("foreground mutex poisoned") else {
             return;
         };
@@ -1336,16 +1431,31 @@ impl MasterState {
         }
     }
 
-    fn broadcast_output(&self, data: &[u8]) {
+    /// Sends [data] to every attached client and into the history, and
+    /// relays the notifications in it while nobody is there to see them.
+    /// Returns the program status sequences in it, for
+    /// [`Self::program_status`] once nothing here is held.
+    fn broadcast_output(&self, data: &[u8]) -> Vec<crate::status::Sequence> {
         let mut history = self.history.lock().expect("history mutex poisoned");
         history.push(data);
-        let found = self
-            .notifications
-            .lock()
-            .expect("notifications mutex poisoned")
-            .feed(data);
+        let (mut found, sequences) = {
+            let mut scanner = self
+                .notifications
+                .lock()
+                .expect("notifications mutex poisoned");
+            let found = scanner.feed(data);
+            (found, scanner.take_status())
+        };
         if !found.is_empty() {
             self.quiet.lock().expect("quiet mutex poisoned").notified();
+        }
+        if self
+            .status
+            .lock()
+            .expect("status mutex poisoned")
+            .reporting()
+        {
+            found.retain(|notice| notice.kind.is_some());
         }
         let clients = self.clients.lock().expect("clients mutex poisoned");
         if !self.present(&clients) {
@@ -1356,7 +1466,7 @@ impl MasterState {
             }
         }
         if clients.is_empty() {
-            return;
+            return sequences;
         }
         let failed = clients
             .iter()
@@ -1370,6 +1480,7 @@ impl MasterState {
                 clients.remove(&id);
             }
         }
+        sequences
     }
 
     fn write_input(&self, data: &[u8]) -> io::Result<()> {
@@ -1419,15 +1530,15 @@ impl MasterState {
                 .expect("devices mutex poisoned")
                 .values(),
         );
-        let activity = self
+        let (activity, program) = self
             .activity
             .lock()
             .expect("activity mutex poisoned")
             .as_ref()
-            .map(crate::Activity::field)
+            .map(|activity| (activity.field(), activity.program_field()))
             .unwrap_or_default();
         format!(
-            "{name}\t1\t{}\t{attached}\t{devices}\t{activity}",
+            "{name}\t1\t{}\t{attached}\t{devices}\t{activity}\t{program}",
             self.created_at
         )
     }
@@ -1559,6 +1670,14 @@ fn client_loop(id: u64, pipe: AsyncPipe, state: Arc<MasterState>) {
             FRAME_DEVICE_CONTROL if !attached => state
                 .device_control(&payload)
                 .and_then(|_| writer.send(FRAME_OK, &[])),
+            crate::FRAME_PROGRAM_STATUS if !attached => {
+                if let Some(report @ crate::status::Sequence::Report(_)) =
+                    crate::status::parse(&payload)
+                {
+                    state.program_status(vec![report]);
+                }
+                writer.send(FRAME_OK, &[])
+            }
             FRAME_HISTORY if !attached => {
                 replay_requested = true;
                 Ok(())
@@ -1567,6 +1686,7 @@ fn client_loop(id: u64, pipe: AsyncPipe, state: Arc<MasterState>) {
                 if !attached {
                     attached = true;
                     state.add_client(id, Arc::clone(&writer), replay_requested, size.rows)?;
+                    state.status_seen();
                 }
                 state.attached_at(id, size, joined)
             }),
@@ -1646,6 +1766,7 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
         RestoreState::default()
     };
     std::fs::create_dir_all(&directory)?;
+    unsafe { env::set_var(crate::SESSION_ID_ENV, crate::session_id(&directory)) };
     install_master_panic_log(directory.clone());
     let directory_log = directory.clone();
     // Before the shell starts, which is what inherits it; nothing else runs yet.
@@ -1680,6 +1801,7 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
         relay: Mutex::new(crate::relay::Relay::default()),
         commands: Mutex::new(crate::relay::CommandWatch::default()),
         quiet: Mutex::new(crate::relay::QuietWatch::default()),
+        status: Mutex::new(crate::status::ProgramStatus::default()),
         last_line: Mutex::new(crate::relay::LastLines::default()),
         program_writes: AtomicU64::new(0),
         quiet_announced: Mutex::new(crate::relay::QuietAnnounced::default()),
@@ -1698,6 +1820,10 @@ pub(crate) fn run_as_master(mut args: impl Iterator<Item = String>) -> io::Resul
         pty_closed: AtomicBool::new(false),
         terminating: AtomicBool::new(false),
     });
+    crate::remember_shell(
+        &state.directory.lock().expect("directory mutex poisoned"),
+        shell_pid,
+    );
 
     let reader_state = Arc::clone(&state);
     thread::spawn(move || {
@@ -1805,23 +1931,49 @@ fn spawn_master(name: &str, size: TermSize) -> io::Result<()> {
     Ok(())
 }
 
+/// Starts the master detached from the app that asked for it. It first asks
+/// to leave the caller's job object, so the master outlives an app that runs
+/// inside one and kills its children on exit. A job that forbids leaving it -
+/// some launchers, terminals and editors start the app in one - refuses that
+/// with `ERROR_ACCESS_DENIED`, and the master then starts inside the job
+/// rather than not at all.
 fn spawn_detached(command_line: &str) -> io::Result<()> {
+    match create_detached(command_line, true) {
+        Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED_CODE) => {
+            create_detached(command_line, false)
+        }
+        result => result,
+    }
+}
+
+/// `ERROR_ACCESS_DENIED`, what `CreateProcessW` answers a breakaway the job
+/// does not allow.
+const ERROR_ACCESS_DENIED_CODE: i32 = 5;
+
+/// The creation flags of a detached master, leaving the caller's job when
+/// [breakaway] is set.
+fn detached_flags(breakaway: bool) -> u32 {
+    let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+    if breakaway {
+        flags | CREATE_BREAKAWAY_FROM_JOB
+    } else {
+        flags
+    }
+}
+
+fn create_detached(command_line: &str, breakaway: bool) -> io::Result<()> {
     unsafe {
         let mut startup_info: STARTUPINFOW = std::mem::zeroed();
         startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
         let mut process_info: PROCESS_INFORMATION = std::mem::zeroed();
         let mut wide_cmd = to_wide(command_line);
-        let flags = DETACHED_PROCESS
-            | CREATE_NEW_PROCESS_GROUP
-            | CREATE_BREAKAWAY_FROM_JOB
-            | CREATE_NO_WINDOW;
         let ok = CreateProcessW(
             std::ptr::null(),
             wide_cmd.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
             0,
-            flags,
+            detached_flags(breakaway),
             std::ptr::null(),
             std::ptr::null(),
             &startup_info,
@@ -1978,6 +2130,44 @@ pub(crate) fn rename_command(old_name: &str, new_name: &str) -> io::Result<()> {
 /// session's master.
 pub(crate) fn device_command(name: &str, payload: &[u8]) -> io::Result<()> {
     control_command(name, FRAME_DEVICE_CONTROL, payload)
+}
+
+/// Where the session directories are, for finding one by its id.
+pub(crate) fn sessions_dir() -> io::Result<PathBuf> {
+    base_dir()
+}
+
+/// This process and the ones above it, nearest first, for finding the
+/// session a hook runs in by its shell, from one snapshot of the process
+/// list.
+pub(crate) fn ancestors() -> Vec<u32> {
+    let mut parents = HashMap::new();
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot != INVALID_HANDLE_VALUE {
+        let mut entry = unsafe { std::mem::zeroed::<PROCESSENTRY32W>() };
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+        while more {
+            parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+            more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+        }
+        unsafe { CloseHandle(snapshot) };
+    }
+    let mut chain = vec![std::process::id()];
+    while chain.len() < 64 {
+        let current = *chain.last().expect("never empty");
+        match parents.get(&current) {
+            Some(&parent) if parent > 0 && !chain.contains(&parent) => chain.push(parent),
+            _ => break,
+        }
+    }
+    chain
+}
+
+/// `hook`: a program status report from an agent's hook, sent to the
+/// session's master as if the program had written it.
+pub(crate) fn program_status_command(name: &str, body: &[u8]) -> io::Result<()> {
+    control_command(name, crate::FRAME_PROGRAM_STATUS, body)
 }
 
 pub(crate) fn kill_command(name: &str) -> io::Result<()> {
@@ -2148,60 +2338,14 @@ fn bridge_terminal(
     // Never joined: the process exits once the output loop below finishes,
     // taking a still-blocked `ReadFile` on stdin down with it.
     thread::spawn(move || {
-        let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-        let mut buffer = [0_u8; 8192];
-        let mut win32_input = Win32InputDecoder::default();
-        let mut presence = PresenceKeys::default();
-        loop {
-            let mut read = 0u32;
-            let ok = unsafe {
-                ReadFile(
-                    stdin,
-                    buffer.as_mut_ptr(),
-                    buffer.len() as u32,
-                    &mut read,
-                    std::ptr::null_mut(),
-                )
-            };
-            if !win_bool(ok) || read == 0 {
-                return;
-            }
-            let (decoded, moves) = presence.feed(&win32_input.feed(&buffer[..read as usize]));
-            for event in moves {
-                let sent = match event {
-                    PresenceEvent::Away => send_frame(&mut &*input_pipe, FRAME_PRESENCE, &[1]),
-                    PresenceEvent::Back => send_frame(&mut &*input_pipe, FRAME_PRESENCE, &[0]),
-                    PresenceEvent::Device(description) => {
-                        send_frame(&mut &*input_pipe, FRAME_DEVICE, description.as_bytes())
-                    }
-                    PresenceEvent::TakeControl => {
-                        input_tolerated.fetch_add(1, Ordering::SeqCst);
-                        send_frame(&mut &*input_pipe, FRAME_CONTROL, &[CONTROL_TAKE])
-                    }
-                    PresenceEvent::Resize(size) => {
-                        send_frame(&mut &*input_pipe, FRAME_RESIZE, &encode_size(size))
-                    }
-                };
-                if sent.is_err() {
-                    return;
-                }
-            }
-            let (forward, detach) = match detach_key.as_mut() {
-                Some(key) => key.feed(&decoded),
-                None => (decoded, false),
-            };
-            if !forward.is_empty() && send_frame(&mut &*input_pipe, FRAME_INPUT, &forward).is_err()
-            {
-                return;
-            }
-            if detach {
-                // The output loop below is blocked reading the pipe; a status
-                // request is what makes the master write to it.
-                input_detached.store(true, Ordering::SeqCst);
-                let _ = send_frame(&mut &*input_pipe, FRAME_STATUS, &[]);
-                return;
-            }
-        }
+        let stdin = StdinHandle(unsafe { GetStdHandle(STD_INPUT_HANDLE) });
+        relay_input(
+            stdin,
+            &mut &*input_pipe,
+            detach_key.as_mut(),
+            &input_tolerated,
+            &input_detached,
+        );
     });
 
     let resize_pipe = Arc::clone(&pipe);
@@ -2271,6 +2415,82 @@ fn bridge_terminal(
     }
 }
 
+/// The attach client's standard input, read with `ReadFile` so a pipe from
+/// the app and a console both work.
+struct StdinHandle(HANDLE);
+
+impl Read for StdinHandle {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let mut read = 0u32;
+        let ok = unsafe {
+            ReadFile(
+                self.0,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                &mut read,
+                std::ptr::null_mut(),
+            )
+        };
+        if !win_bool(ok) {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(read as usize)
+    }
+}
+
+/// Forwards what the user types to the master until the input ends. The end
+/// of the input - the app closed its pipe or went away - or the detach key
+/// both detach: [detached] is set and a status request wakes the output loop,
+/// which is blocked reading the pipe, so the client exits instead of staying
+/// attached to a session nobody can see.
+fn relay_input<R: Read, W: Write>(
+    mut input: R,
+    pipe: &mut W,
+    mut detach_key: Option<&mut DetachKey>,
+    tolerated: &AtomicUsize,
+    detached: &AtomicBool,
+) {
+    let mut buffer = [0_u8; 8192];
+    let mut win32_input = Win32InputDecoder::default();
+    let mut presence = PresenceKeys::default();
+    loop {
+        let read = match input.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        let (decoded, moves) = presence.feed(&win32_input.feed(&buffer[..read]));
+        for event in moves {
+            let sent = match event {
+                PresenceEvent::Away => send_frame(pipe, FRAME_PRESENCE, &[1]),
+                PresenceEvent::Back => send_frame(pipe, FRAME_PRESENCE, &[0]),
+                PresenceEvent::Device(description) => {
+                    send_frame(pipe, FRAME_DEVICE, description.as_bytes())
+                }
+                PresenceEvent::TakeControl => {
+                    tolerated.fetch_add(1, Ordering::SeqCst);
+                    send_frame(pipe, FRAME_CONTROL, &[CONTROL_TAKE])
+                }
+                PresenceEvent::Resize(size) => send_frame(pipe, FRAME_RESIZE, &encode_size(size)),
+            };
+            if sent.is_err() {
+                return;
+            }
+        }
+        let (forward, detach) = match detach_key.as_deref_mut() {
+            Some(key) => key.feed(&decoded),
+            None => (decoded, false),
+        };
+        if !forward.is_empty() && send_frame(pipe, FRAME_INPUT, &forward).is_err() {
+            return;
+        }
+        if detach {
+            break;
+        }
+    }
+    detached.store(true, Ordering::SeqCst);
+    let _ = send_frame(pipe, FRAME_STATUS, &[]);
+}
+
 /// UTF-8's code page number, `CP_UTF8`.
 const UTF8_CODE_PAGE: u32 = 65001;
 
@@ -2334,5 +2554,67 @@ impl Drop for ConsoleRawMode {
                 SetConsoleOutputCP(self.original_output_cp);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod detached_spawn_tests {
+    use super::*;
+
+    #[test]
+    fn the_first_try_leaves_the_job_and_the_fallback_stays_in_it() {
+        assert_ne!(detached_flags(true) & CREATE_BREAKAWAY_FROM_JOB, 0);
+        assert_eq!(detached_flags(false) & CREATE_BREAKAWAY_FROM_JOB, 0);
+        for breakaway in [true, false] {
+            let flags = detached_flags(breakaway);
+            assert_ne!(flags & DETACHED_PROCESS, 0);
+            assert_ne!(flags & CREATE_NO_WINDOW, 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod relay_input_tests {
+    use super::*;
+
+    fn frames(mut written: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut all = Vec::new();
+        while !written.is_empty() {
+            all.push(read_frame(&mut written).expect("frame"));
+        }
+        all
+    }
+
+    #[test]
+    fn the_end_of_the_input_detaches() {
+        let mut pipe = Vec::new();
+        let detached = AtomicBool::new(false);
+        relay_input(
+            &b"ls\r"[..],
+            &mut pipe,
+            None,
+            &AtomicUsize::new(0),
+            &detached,
+        );
+        assert!(detached.load(Ordering::SeqCst));
+        assert_eq!(
+            frames(&pipe),
+            vec![(FRAME_INPUT, b"ls\r".to_vec()), (FRAME_STATUS, Vec::new())]
+        );
+    }
+
+    #[test]
+    fn a_broken_input_detaches_too() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+        }
+        let mut pipe = Vec::new();
+        let detached = AtomicBool::new(false);
+        relay_input(Broken, &mut pipe, None, &AtomicUsize::new(0), &detached);
+        assert!(detached.load(Ordering::SeqCst));
+        assert_eq!(frames(&pipe), vec![(FRAME_STATUS, Vec::new())]);
     }
 }
